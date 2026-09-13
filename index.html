@@ -2997,6 +2997,14 @@ async function cloudBackupPush(){
     // concurrent push to finish later and stomp a newer, already-
     // complete manifest with an older version number.
     const manifestRef=backupRoot.doc('manifest');
+    // v[TEST BUILD] Version-history index doc path: backupRoot is itself
+    // a CollectionReference (users/{uid}/backup), which cannot take a
+    // nested .collection() call directly — Firestore only allows
+    // Collection->Document->Collection, never Collection->Collection.
+    // 'historyIndex' is a plain document that HOLDS the 'versions'
+    // subcollection, exactly like backupRoot.doc('versions') already
+    // does for the actual entity data above.
+    const historyVersionRef=backupRoot.doc('historyIndex').collection('versions').doc(String(nextVersion));
     await FB.db.runTransaction(async tx=>{
       const snap=await tx.get(manifestRef);
       const currentVersion=snap.exists&&typeof snap.data().version==='number'?snap.data().version:0;
@@ -3008,6 +3016,14 @@ async function cloudBackupPush(){
         savedAt:firebase.firestore.FieldValue.serverTimestamp(),
         entityCounts, attachmentCount,
         schemaVersion:SCHEMA, appVersion:(typeof APP_VERSION!=='undefined'?APP_VERSION:null)
+      });
+      // Written in the SAME transaction as the manifest so the two can
+      // never go out of sync (e.g. manifest advances but history write
+      // silently fails, or vice versa).
+      tx.set(historyVersionRef,{
+        version:nextVersion, savedAt:firebase.firestore.FieldValue.serverTimestamp(),
+        entityCounts, attachmentCount, schemaVersion:SCHEMA,
+        appVersion:(typeof APP_VERSION!=='undefined'?APP_VERSION:null)
       });
     });
 
@@ -3043,6 +3059,76 @@ async function cloudBackupPush(){
 // treats an entity-count mismatch against the manifest as a fatal
 // restore error instead of silently treating a missing document as an
 // empty collection and wiping that module's data.
+// v[TEST BUILD] Shared core: fetches + rehydrates every entity type for a
+// SPECIFIC version number, verified against expectedCounts. Throws on any
+// integrity mismatch — callers must not touch DB.entities until this
+// resolves successfully, so a failure (including a dropped connection)
+// always leaves local data untouched.
+async function _cloudBackupFetchVersionEntities(uid, version, expectedCounts){
+  const versionCol=FB.db.collection('users').doc(uid).collection('backup').doc('versions').collection(String(version));
+  const restoredEntities={};
+
+  for(const type of CLOUD_BACKUP_ENTITY_TYPES){
+    const recordsSnap=await versionCol.doc(type).collection('records').get();
+    const expectedCount=(expectedCounts && typeof expectedCounts[type]==='number')
+      ? expectedCounts[type] : null;
+    const items={};
+    const isScalarType=CLOUD_BACKUP_SCALAR_VALUE_TYPES.includes(type);
+    recordsSnap.forEach(doc=>{ items[doc.id]=isScalarType ? doc.data().value : doc.data(); });
+    const actualCount=Object.keys(items).length;
+    if(expectedCount!==null && actualCount!==expectedCount){
+      throw new Error(`restore-integrity-error: "${type}" expected ${expectedCount} records, found ${actualCount} at version ${version}`);
+    }
+    for(const id of Object.keys(items)){
+      const rec=items[id];
+      if(!rec || typeof rec!=='object') continue;
+      if(Array.isArray(rec.attachments)){
+        for(let i=0;i<rec.attachments.length;i++){
+          const a=rec.attachments[i];
+          if(a && a.backedUp && a.storagePath){
+            const dataUrl=await cloudBackupDownloadAttachment(uid, a.storagePath, false, {size:a.backupSize, sha256:a.backupSha256});
+            const cleaned=Object.assign({}, a, {dataUrl});
+            delete cleaned.backedUp; delete cleaned.storagePath; delete cleaned.backupSize; delete cleaned.backupSha256;
+            rec.attachments[i]=cleaned;
+          }
+        }
+      }
+      if(rec.encryptedPayloadBackedUp && rec.encryptedPayloadStoragePath){
+        rec.encryptedPayload=await cloudBackupDownloadAttachment(uid, rec.encryptedPayloadStoragePath, true, {size:rec.encryptedPayloadBackupSize, sha256:rec.encryptedPayloadBackupSha256});
+        delete rec.encryptedPayloadBackedUp; delete rec.encryptedPayloadStoragePath; delete rec.encryptedPayloadBackupSize; delete rec.encryptedPayloadBackupSha256;
+      }
+      if(Array.isArray(rec.versions)){
+        for(let vi=0; vi<rec.versions.length; vi++){
+          const v=rec.versions[vi];
+          if(!v || typeof v!=='object') continue;
+          if(Array.isArray(v.attachments)){
+            for(let i=0;i<v.attachments.length;i++){
+              const a=v.attachments[i];
+              if(a && a.backedUp && a.storagePath){
+                const dataUrl=await cloudBackupDownloadAttachment(uid, a.storagePath, false, {size:a.backupSize, sha256:a.backupSha256});
+                const cleaned=Object.assign({}, a, {dataUrl});
+                delete cleaned.backedUp; delete cleaned.storagePath; delete cleaned.backupSize; delete cleaned.backupSha256;
+                v.attachments[i]=cleaned;
+              }
+            }
+          }
+          if(v.encryptedPayloadBackedUp && v.encryptedPayloadStoragePath){
+            v.encryptedPayload=await cloudBackupDownloadAttachment(uid, v.encryptedPayloadStoragePath, true, {size:v.encryptedPayloadBackupSize, sha256:v.encryptedPayloadBackupSha256});
+            delete v.encryptedPayloadBackedUp; delete v.encryptedPayloadStoragePath; delete v.encryptedPayloadBackupSize; delete v.encryptedPayloadBackupSha256;
+          }
+        }
+      }
+    }
+    restoredEntities[type]=items;
+  }
+
+  const metaSnap=await versionCol.doc('_meta').get();
+  if(!metaSnap.exists){
+    throw new Error(`restore-integrity-error: settings ("_meta") document is missing at version ${version}`);
+  }
+  return {restoredEntities, restoredMeta:metaSnap.data()};
+}
+
 async function cloudBackupPull(){
   const uid=cloudBackupUid();
   if(!uid) return {ok:false, reason:'not-signed-in'};
@@ -3054,114 +3140,13 @@ async function cloudBackupPull(){
   if(!gate.allowed) return {ok:false, reason:gate.reason};
 
   try{
-    // v[next] FIX (code review, 2026-09-08): path matches the new
-    // backup/versions/{version}/{type} structure cloudBackupPush now
-    // actually writes to.
-    const versionCol=FB.db.collection('users').doc(uid).collection('backup').doc('versions').collection(String(cloudManifest.version));
-    const restoredEntities={};
-
-    for(const type of CLOUD_BACKUP_ENTITY_TYPES){
-      // v[next] FIX (code review round 2, 2026-09-08): reads the
-      // records subcollection (one document per record) that
-      // cloudBackupPush now actually writes, instead of a single
-      // document holding an items:{...} map.
-      const recordsSnap=await versionCol.doc(type).collection('records').get();
-      const expectedCount=(cloudManifest.entityCounts && typeof cloudManifest.entityCounts[type]==='number')
-        ? cloudManifest.entityCounts[type] : null;
-      const items={};
-      // v[next] FIX (code review round 4, 2026-09-08): symmetric unwrap
-      // for the same three entity types wrapped on push above.
-      const isScalarType=CLOUD_BACKUP_SCALAR_VALUE_TYPES.includes(type);
-      recordsSnap.forEach(doc=>{ items[doc.id]=isScalarType ? doc.data().value : doc.data(); });
-      const actualCount=Object.keys(items).length;
-      if(expectedCount!==null && actualCount!==expectedCount){
-        throw new Error(`restore-integrity-error: "${type}" expected ${expectedCount} records, found ${actualCount} at version ${cloudManifest.version}`);
-      }
-      for(const id of Object.keys(items)){
-        const rec=items[id];
-        if(!rec || typeof rec!=='object') continue;
-        // Nested attachments[] entries (real, confirmed path for
-        // documents[id].attachments[]) — each one individually rehydrated,
-        // now verified against the exact size/hash recorded at upload time.
-        if(Array.isArray(rec.attachments)){
-          for(let i=0;i<rec.attachments.length;i++){
-            const a=rec.attachments[i];
-            if(a && a.backedUp && a.storagePath){
-              const dataUrl=await cloudBackupDownloadAttachment(uid, a.storagePath, false, {size:a.backupSize, sha256:a.backupSha256});
-              const cleaned=Object.assign({}, a, {dataUrl});
-              delete cleaned.backedUp;
-              delete cleaned.storagePath;
-              delete cleaned.backupSize;
-              delete cleaned.backupSha256;
-              rec.attachments[i]=cleaned;
-            }
-          }
-        }
-        // Top-level encryptedPayload (secure documents, vaultItems) —
-        // ciphertext-aware download, now verified against the exact
-        // size/hash recorded at upload time, never the plain data: URL
-        // path.
-        if(rec.encryptedPayloadBackedUp && rec.encryptedPayloadStoragePath){
-          rec.encryptedPayload=await cloudBackupDownloadAttachment(uid, rec.encryptedPayloadStoragePath, true, {size:rec.encryptedPayloadBackupSize, sha256:rec.encryptedPayloadBackupSha256});
-          delete rec.encryptedPayloadBackedUp;
-          delete rec.encryptedPayloadStoragePath;
-          delete rec.encryptedPayloadBackupSize;
-          delete rec.encryptedPayloadBackupSha256;
-        }
-        // v[next] FIX (root-cause pass, code review round 6, 2026-09-08):
-        // symmetric rehydration for documents[id].versions[] — each
-        // edit-history entry can carry its OWN extracted
-        // attachments[]/encryptedPayload (see cloudBackupExtractAttachments'
-        // Case 2), which push correctly extracts but restore never
-        // looked at until now. Same per-item size/hash verification as
-        // the top-level cases above.
-        if(Array.isArray(rec.versions)){
-          for(let vi=0; vi<rec.versions.length; vi++){
-            const v=rec.versions[vi];
-            if(!v || typeof v!=='object') continue;
-            if(Array.isArray(v.attachments)){
-              for(let i=0;i<v.attachments.length;i++){
-                const a=v.attachments[i];
-                if(a && a.backedUp && a.storagePath){
-                  const dataUrl=await cloudBackupDownloadAttachment(uid, a.storagePath, false, {size:a.backupSize, sha256:a.backupSha256});
-                  const cleaned=Object.assign({}, a, {dataUrl});
-                  delete cleaned.backedUp;
-                  delete cleaned.storagePath;
-                  delete cleaned.backupSize;
-                  delete cleaned.backupSha256;
-                  v.attachments[i]=cleaned;
-                }
-              }
-            }
-            if(v.encryptedPayloadBackedUp && v.encryptedPayloadStoragePath){
-              v.encryptedPayload=await cloudBackupDownloadAttachment(uid, v.encryptedPayloadStoragePath, true, {size:v.encryptedPayloadBackupSize, sha256:v.encryptedPayloadBackupSha256});
-              delete v.encryptedPayloadBackedUp;
-              delete v.encryptedPayloadStoragePath;
-              delete v.encryptedPayloadBackupSize;
-              delete v.encryptedPayloadBackupSha256;
-            }
-          }
-        }
-      }
-      restoredEntities[type]=items;
-    }
-
-    const metaSnap=await versionCol.doc('_meta').get();
-    // v[next] FIX (code review, 2026-09-08): a missing settings document
-    // is now treated exactly like a missing/mismatched entity-type doc —
-    // a fatal integrity error that aborts BEFORE any local data is
-    // touched — rather than silently proceeding with empty settings.
-    if(!metaSnap.exists){
-      throw new Error(`restore-integrity-error: settings ("_meta") document is missing at version ${cloudManifest.version}`);
-    }
-    const restoredMeta=metaSnap.data();
-
+    const {restoredEntities, restoredMeta}=await _cloudBackupFetchVersionEntities(uid, cloudManifest.version, cloudManifest.entityCounts);
     // Replacing DB.entities wholesale is now safe — every type above
     // either matched its expected count exactly or threw, so there is no
     // path left where a silently-empty collection could reach this line.
     DB.entities=Object.assign(blankDB().entities, restoredEntities);
     for(const k of CLOUD_BACKUP_META_FIELDS){ if(k in restoredMeta) DB.meta[k]=restoredMeta[k]; }
-    DB.meta.cloudBackup=Object.assign({}, DB.meta.cloudBackup, {cloudBackupLastSyncedVersion:cloudManifest.version, lastRestoreAt:new Date().toISOString()});
+    DB.meta.cloudBackup=Object.assign({}, DB.meta.cloudBackup, {cloudBackupLastSyncedVersion:cloudManifest.version, lastRestoreAt:new Date().toISOString(), lastRestoredVersion:cloudManifest.version});
     persistDB(true); // true: nothing new to push right after a pull, and a pointless immediate push would just waste quota
     try{ if(typeof applyTheme==='function') applyTheme(); }catch(e){}
     return {ok:true, version:cloudManifest.version};
@@ -3169,6 +3154,54 @@ async function cloudBackupPull(){
     console.error('cloudBackupPull failed:', e);
     return {ok:false, reason:'pull-failed', error:String(e&&e.message||e)};
   }
+}
+
+// v[TEST BUILD] Restore a SPECIFIC past version the user hand-picked from
+// Settings, instead of whatever the live manifest currently points to.
+// Critically: on success we mark cloudBackupLastSyncedVersion as the
+// CURRENT LIVE manifest version (not the older one we just restored) —
+// otherwise cloudBackupCanPush() would permanently block this device's
+// next backup as "local-behind-cloud" (the exact trap already found and
+// fixed for the decline-restore-at-boot case). The picked version's data
+// becomes local; the device's push eligibility stays tied to the latest
+// known cloud state, which it has now explicitly acknowledged.
+async function cloudBackupPullVersion(version){
+  const uid=cloudBackupUid();
+  if(!uid) return {ok:false, reason:'not-signed-in'};
+  let liveManifest=null, historyDoc=null;
+  try{
+    liveManifest=await cloudBackupReadManifest(uid);
+    const hSnap=await FB.db.collection('users').doc(uid).collection('backup').doc('historyIndex').collection('versions').doc(String(version)).get();
+    if(!hSnap.exists) return {ok:false, reason:'version-not-found'};
+    historyDoc=hSnap.data();
+  }catch(e){ return {ok:false, reason:'read-manifest-failed'}; }
+
+  try{
+    const {restoredEntities, restoredMeta}=await _cloudBackupFetchVersionEntities(uid, version, historyDoc.entityCounts);
+    DB.entities=Object.assign(blankDB().entities, restoredEntities);
+    for(const k of CLOUD_BACKUP_META_FIELDS){ if(k in restoredMeta) DB.meta[k]=restoredMeta[k]; }
+    const ackVersion=(liveManifest && typeof liveManifest.version==='number') ? liveManifest.version : version;
+    DB.meta.cloudBackup=Object.assign({}, DB.meta.cloudBackup, {cloudBackupLastSyncedVersion:ackVersion, lastRestoreAt:new Date().toISOString(), lastRestoredVersion:version});
+    persistDB(true);
+    try{ if(typeof applyTheme==='function') applyTheme(); }catch(e){}
+    return {ok:true, version:version};
+  }catch(e){
+    console.error('cloudBackupPullVersion failed:', e);
+    return {ok:false, reason:'pull-failed', error:String(e&&e.message||e)};
+  }
+}
+
+// v[TEST BUILD] List available versions for the Settings version-picker,
+// newest first. Relies on the history collection written by cloudBackupPush
+// — versions pushed before this test build shipped won't appear here (no
+// retroactive index), but every version pushed from now on will.
+async function cloudBackupListVersionHistory(){
+  const uid=cloudBackupUid();
+  if(!uid) return [];
+  try{
+    const snap=await FB.db.collection('users').doc(uid).collection('backup').doc('historyIndex').collection('versions').orderBy('version','desc').limit(20).get();
+    return snap.docs.map(d=>d.data());
+  }catch(e){ console.error('cloudBackupListVersionHistory failed:', e); return []; }
 }
 
 async function cloudBackupMaybeAutoRestoreOnBoot(){
@@ -3184,6 +3217,84 @@ async function cloudBackupMaybeAutoRestoreOnBoot(){
     console.error('cloudBackupMaybeAutoRestoreOnBoot failed (non-fatal, app continues with local/empty state):', e);
     return {ok:false, reason:'auto-restore-failed', error:e};
   }
+}
+
+// v[TEST BUILD] Same eligibility check as cloudBackupMaybeAutoRestoreOnBoot,
+// but instead of silently restoring, ASKS the user first — matching the
+// WhatsApp-style "a backup was found, restore it?" pattern. If the user
+// declines, we must not leave this device permanently unable to push new
+// data: cloudBackupCanPush() blocks any push where localMeta's synced
+// version trails the cloud manifest, so declining without acknowledging
+// the cloud version would silently brick all future backups. We
+// therefore record the cloud version as "seen" (cloudBackupLastSyncedVersion)
+// WITHOUT importing its data. This does NOT delete or touch the old
+// backup's documents — push never deletes anything (see cloudBackupPush) —
+// so the declined backup remains intact in Firestore, just orphaned from
+// this device's future version chain (a version-history/retention feature,
+// tracked separately, is what would let a user recover it later).
+async function cloudBackupPromptOnBoot(){
+  try{
+    if(!cloudBackupIsLocalEmpty(DB)) return {ok:true, reason:'local-not-empty'};
+    const uid=cloudBackupUid();
+    if(!uid) return {ok:false, reason:'not-signed-in'};
+    const manifest=await cloudBackupReadManifest(uid);
+    const gate=cloudBackupCanRestore(manifest);
+    if(!gate.allowed) return {ok:false, reason:gate.reason};
+
+    const choice=await cloudBackupShowRestoreDialog(manifest);
+    if(choice==='restore'){
+      return await cloudBackupPull();
+    }else{
+      // Acknowledge the cloud version without importing it, so future
+      // pushes from this device are allowed (see cloudBackupCanPush) and
+      // start a NEW version chain — the declined backup's own documents
+      // are never touched or deleted by this.
+      DB.meta.cloudBackup=Object.assign({}, DB.meta.cloudBackup, {cloudBackupLastSyncedVersion:manifest.version});
+      try{ persistDB(true); }catch(e){}
+      return {ok:true, reason:'user-declined-restore', acknowledgedVersion:manifest.version};
+    }
+  }catch(e){
+    console.error('cloudBackupPromptOnBoot failed (non-fatal, app continues with local/empty state):', e);
+    return {ok:false, reason:'auto-restore-prompt-failed', error:e};
+  }
+}
+
+// Minimal blocking dialog (test build). Returns a Promise resolving to
+// 'restore' or 'skip'. Uses inline styles so it renders correctly even
+// before the main stylesheet/theme classes are guaranteed ready this
+// early in boot.
+function cloudBackupShowRestoreDialog(manifest){
+  return new Promise((resolve)=>{
+    const when=(function(){
+      try{
+        const raw=manifest && (manifest.savedAt || manifest.updatedAt);
+        if(!raw) return '';
+        const d=(raw && typeof raw.toDate==='function')?raw.toDate():new Date(raw);
+        return d.toLocaleString();
+      }catch(e){ return ''; }
+    })();
+    const isFa=(typeof L!=='undefined' && L==='fa');
+    const title=isFa?'یک بکاپ پیدا شد':'A backup was found';
+    const body=isFa
+      ? ('بکاپی از اطلاعاتِ شما'+(when?(' مربوط به '+when):'')+' پیدا شد. می‌خواهید بازیابی شود؟')
+      : ('A backup of your data'+(when?(' from '+when):'')+' was found. Would you like to restore it?');
+    const restoreLabel=isFa?'بازیابی اطلاعات':'Restore my data';
+    const skipLabel=isFa?'فعلاً بدون بازیابی ادامه بده':'Continue without restoring';
+
+    const overlay=document.createElement('div');
+    overlay.style.cssText='position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;padding:24px;font-family:inherit';
+    overlay.innerHTML=`
+      <div style="background:#16161d;color:#fff;border-radius:16px;padding:20px;max-width:360px;width:100%;box-shadow:0 10px 40px rgba(0,0,0,.5)" dir="${isFa?'rtl':'ltr'}">
+        <div style="font-weight:700;font-size:16px;margin-bottom:8px">${title}</div>
+        <div style="font-size:13px;color:#c9c9d4;line-height:1.6;margin-bottom:18px">${body}</div>
+        <button id="cb-dlg-restore" style="width:100%;padding:12px;border:none;border-radius:10px;background:#6e56f8;color:#fff;font-weight:700;font-size:14px;margin-bottom:8px">${restoreLabel}</button>
+        <button id="cb-dlg-skip" style="width:100%;padding:12px;border:none;border-radius:10px;background:transparent;color:#9a9aa8;font-size:13px">${skipLabel}</button>
+      </div>`;
+    document.body.appendChild(overlay);
+    const cleanup=(val)=>{ try{ overlay.remove(); }catch(e){} resolve(val); };
+    overlay.querySelector('#cb-dlg-restore').onclick=()=>cleanup('restore');
+    overlay.querySelector('#cb-dlg-skip').onclick=()=>cleanup('skip');
+  });
 }
 
 // Debounced push trigger — safe to call as often as persistDB() itself
@@ -26242,7 +26353,7 @@ function initAuth(){
       // a moment before the real data arrives. Only acts when the local
       // DB is genuinely empty (see cloudBackupIsLocalEmpty), so this is a
       // fast no-op for any account that already has local data.
-      try{ if(typeof cloudBackupMaybeAutoRestoreOnBoot==='function') await cloudBackupMaybeAutoRestoreOnBoot(); }catch(e){ console.error('cloudBackupMaybeAutoRestoreOnBoot threw (continuing boot with local/empty state):', e); }
+      try{ if(typeof cloudBackupPromptOnBoot==='function') await cloudBackupPromptOnBoot(); }catch(e){ console.error('cloudBackupPromptOnBoot threw (continuing boot with local/empty state):', e); }
       saveDB();
       startListeners();
       try{ if(window._pendingFamilyInvite && typeof FamilyBackend!=='undefined'){ FamilyBackend.setPending(window._pendingFamilyInvite); currentModule='family'; screen='module'; famView='joinInvite'; } }catch(e){}
@@ -26901,6 +27012,8 @@ function openSettingsSheet(){
           <button class="btn btn-ghost" id="cb-test-push" style="flex:1">Backup now</button>
           <button class="btn btn-ghost" id="cb-test-pull" style="flex:1">Restore now</button>
         </div>
+        <button class="btn btn-ghost" id="cb-test-history" style="width:100%;margin-top:8px">Restore a specific version…</button>
+        <div id="cb-test-history-list" style="margin-top:8px;display:none"></div>
       </div>
 
       <div style="padding:6px 14px 24px"><button class="set-signout" data-set="signout">${tr('signOut')}</button></div>
@@ -26932,6 +27045,8 @@ function openSettingsSheet(){
       refreshStatus(extra);
     };
     if(pullBtn) pullBtn.onclick=async()=>{
+      const ok=confirm('This will overwrite your CURRENT local data (tasks, notes, everything) with the latest cloud backup. This cannot be undone locally. Continue?');
+      if(!ok) return;
       pullBtn.disabled=true; pullBtn.textContent='Restoring…';
       let extra=null;
       try{
@@ -26942,6 +27057,49 @@ function openSettingsSheet(){
       pullBtn.disabled=false; pullBtn.textContent='Restore now';
       refreshStatus(extra);
       try{ render(); }catch(e){}
+    };
+
+    const historyBtn=document.getElementById('cb-test-history');
+    const historyListEl=document.getElementById('cb-test-history-list');
+    if(historyBtn) historyBtn.onclick=async()=>{
+      if(historyListEl.style.display!=='none'){ historyListEl.style.display='none'; historyListEl.innerHTML=''; return; }
+      historyBtn.disabled=true; historyBtn.textContent='Loading versions…';
+      const versions=await cloudBackupListVersionHistory();
+      historyBtn.disabled=false; historyBtn.textContent='Restore a specific version…';
+      if(!versions.length){
+        historyListEl.innerHTML='<div style="font-size:12px;color:var(--ink3);padding:8px 0">No version history found (only versions pushed by this test build are listed).</div>';
+        historyListEl.style.display='block';
+        return;
+      }
+      historyListEl.innerHTML=versions.map(v=>{
+        const when=(()=>{ try{ return v.savedAt&&v.savedAt.toDate ? v.savedAt.toDate().toLocaleString() : ''; }catch(e){ return ''; } })();
+        const counts=v.entityCounts?Object.entries(v.entityCounts).filter(([k,n])=>n>0).map(([k,n])=>k+':'+n).join(', '):'';
+        return `<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px;border:1px solid var(--b1);border-radius:8px;margin-bottom:6px">
+          <div style="font-size:11px;line-height:1.5">
+            <div style="font-weight:700">Version ${esc(String(v.version))} — ${esc(when)}</div>
+            <div style="color:var(--ink3)">${esc(counts)}</div>
+          </div>
+          <button class="btn btn-ghost cb-hist-restore" data-version="${esc(String(v.version))}" style="white-space:nowrap;font-size:12px">Restore</button>
+        </div>`;
+      }).join('');
+      historyListEl.style.display='block';
+      historyListEl.querySelectorAll('.cb-hist-restore').forEach(btn=>{
+        btn.onclick=async()=>{
+          const v=parseInt(btn.dataset.version,10);
+          const ok=confirm('This will overwrite your CURRENT local data (tasks, notes, everything) with version '+v+'. This cannot be undone locally. Continue?');
+          if(!ok) return;
+          btn.disabled=true; btn.textContent='Restoring…';
+          let extra=null;
+          try{
+            const r=await cloudBackupPullVersion(v);
+            if(r&&r.ok){ toast('Restored version '+v); }
+            else { extra='FAILED — reason: '+JSON.stringify(r); toast('Restore failed, see status below'); }
+          }catch(e){ extra='THREW — '+(e&&e.stack||e); toast('Restore threw, see status below'); }
+          btn.disabled=false; btn.textContent='Restore';
+          refreshStatus(extra);
+          try{ render(); }catch(e){}
+        };
+      });
     };
   }
   requestAnimationFrame(()=>ov.classList.add('on'));
