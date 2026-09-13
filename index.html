@@ -3195,13 +3195,32 @@ async function cloudBackupPullVersion(version){
 // newest first. Relies on the history collection written by cloudBackupPush
 // — versions pushed before this test build shipped won't appear here (no
 // retroactive index), but every version pushed from now on will.
-async function cloudBackupListVersionHistory(){
+// v[TEST BUILD] afterVersion: pass the LAST version number already shown
+// to page in the next batch (older versions), instead of re-fetching from
+// the top every time — a real device could have hundreds of pushes over
+// months of use, and 20 was silently a hard ceiling with no way to see
+// anything older until this was added.
+async function cloudBackupListVersionHistory(afterVersion){
   const uid=cloudBackupUid();
-  if(!uid) return [];
+  if(!uid) return {items:[], hasMore:false, error:'not-signed-in'};
   try{
-    const snap=await FB.db.collection('users').doc(uid).collection('backup').doc('historyIndex').collection('versions').orderBy('version','desc').limit(20).get();
-    return snap.docs.map(d=>d.data());
-  }catch(e){ console.error('cloudBackupListVersionHistory failed:', e); return []; }
+    let q=FB.db.collection('users').doc(uid).collection('backup').doc('historyIndex').collection('versions').orderBy('version','desc');
+    if(typeof afterVersion==='number') q=q.startAfter(afterVersion);
+    // Fetch one extra to know whether a further page exists, without
+    // showing it yet.
+    const snap=await q.limit(21).get();
+    const docs=snap.docs.map(d=>d.data());
+    const hasMore=docs.length>20;
+    return {items:docs.slice(0,20), hasMore};
+  }catch(e){
+    // v[TEST BUILD] A genuine failure (permission-denied, offline, etc.)
+    // must be distinguishable from "reached the end of the list" —
+    // returning the same {items:[], hasMore:false} shape for both meant
+    // a real error silently looked identical to an empty/exhausted
+    // history to every caller. error is only ever set on a real failure.
+    console.error('cloudBackupListVersionHistory failed:', e);
+    return {items:[], hasMore:false, error:String(e&&e.message||e)};
+  }
 }
 
 async function cloudBackupMaybeAutoRestoreOnBoot(){
@@ -27061,17 +27080,11 @@ function openSettingsSheet(){
 
     const historyBtn=document.getElementById('cb-test-history');
     const historyListEl=document.getElementById('cb-test-history-list');
-    if(historyBtn) historyBtn.onclick=async()=>{
-      if(historyListEl.style.display!=='none'){ historyListEl.style.display='none'; historyListEl.innerHTML=''; return; }
-      historyBtn.disabled=true; historyBtn.textContent='Loading versions…';
-      const versions=await cloudBackupListVersionHistory();
-      historyBtn.disabled=false; historyBtn.textContent='Restore a specific version…';
-      if(!versions.length){
-        historyListEl.innerHTML='<div style="font-size:12px;color:var(--ink3);padding:8px 0">No version history found (only versions pushed by this test build are listed).</div>';
-        historyListEl.style.display='block';
-        return;
-      }
-      historyListEl.innerHTML=versions.map(v=>{
+    let historyLoadedVersions=[]; // accumulates across "show more" pages, oldest-loaded at the end
+    let historyLoadError=null;
+
+    function renderHistoryList(){
+      const rows=historyLoadedVersions.map(v=>{
         const when=(()=>{ try{ return v.savedAt&&v.savedAt.toDate ? v.savedAt.toDate().toLocaleString() : ''; }catch(e){ return ''; } })();
         const counts=v.entityCounts?Object.entries(v.entityCounts).filter(([k,n])=>n>0).map(([k,n])=>k+':'+n).join(', '):'';
         return `<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px;border:1px solid var(--b1);border-radius:8px;margin-bottom:6px">
@@ -27082,25 +27095,83 @@ function openSettingsSheet(){
           <button class="btn btn-ghost cb-hist-restore" data-version="${esc(String(v.version))}" style="white-space:nowrap;font-size:12px">Restore</button>
         </div>`;
       }).join('');
+      // v[TEST BUILD] A real fetch error (permission-denied, offline,
+      // etc.) is rendered as its own row with a Retry button — NEVER
+      // silently collapsed into "no more versions", which would hide a
+      // genuine failure and make older backups look unreachable when
+      // they're actually just one retry away.
+      let tailHtml='';
+      if(historyLoadError){
+        tailHtml=`<div style="padding:8px;border:1px solid #f43f5e55;border-radius:8px;font-size:11px">
+          <div style="color:#f43f5e;margin-bottom:6px">Couldn't load more versions — ${esc(historyLoadError)}</div>
+          <button class="btn btn-ghost" id="cb-hist-retry" style="width:100%">Retry</button>
+        </div>`;
+      }else if(historyListEl.dataset.hasMore==='1'){
+        tailHtml=`<button class="btn btn-ghost" id="cb-hist-more" style="width:100%">Show older versions…</button>`;
+      }
+      historyListEl.innerHTML=rows+tailHtml;
+    }
+
+    if(historyBtn) historyBtn.onclick=async()=>{
+      if(historyListEl.style.display!=='none'){ historyListEl.style.display='none'; historyListEl.innerHTML=''; historyLoadedVersions=[]; historyLoadError=null; return; }
+      historyBtn.disabled=true; historyBtn.textContent='Loading versions…';
+      const {items, hasMore, error}=await cloudBackupListVersionHistory();
+      historyBtn.disabled=false; historyBtn.textContent='Restore a specific version…';
+      historyLoadedVersions=items;
+      historyListEl.dataset.hasMore=hasMore?'1':'0';
+      historyLoadError=error||null;
+      if(error){
+        historyListEl.innerHTML=`<div style="padding:8px;border:1px solid #f43f5e55;border-radius:8px;font-size:11px">
+          <div style="color:#f43f5e;margin-bottom:6px">Couldn't load version history — ${esc(error)}</div>
+          <button class="btn btn-ghost" id="cb-hist-retry" style="width:100%">Retry</button>
+        </div>`;
+        historyListEl.style.display='block';
+        return;
+      }
+      if(!items.length){
+        historyListEl.innerHTML='<div style="font-size:12px;color:var(--ink3);padding:8px 0">No version history found (only versions pushed by this test build are listed).</div>';
+        historyListEl.style.display='block';
+        return;
+      }
+      renderHistoryList();
       historyListEl.style.display='block';
-      historyListEl.querySelectorAll('.cb-hist-restore').forEach(btn=>{
-        btn.onclick=async()=>{
-          const v=parseInt(btn.dataset.version,10);
-          const ok=confirm('This will overwrite your CURRENT local data (tasks, notes, everything) with version '+v+'. This cannot be undone locally. Continue?');
-          if(!ok) return;
-          btn.disabled=true; btn.textContent='Restoring…';
-          let extra=null;
-          try{
-            const r=await cloudBackupPullVersion(v);
-            if(r&&r.ok){ toast('Restored version '+v); }
-            else { extra='FAILED — reason: '+JSON.stringify(r); toast('Restore failed, see status below'); }
-          }catch(e){ extra='THREW — '+(e&&e.stack||e); toast('Restore threw, see status below'); }
-          btn.disabled=false; btn.textContent='Restore';
-          refreshStatus(extra);
-          try{ render(); }catch(e){}
-        };
-      });
     };
+
+    // Event delegation for "Restore" (per version), "Show older
+    // versions…" (pagination), and "Retry" (after a failed page fetch)
+    // — bound once on the container instead of re-attaching listeners
+    // every render, so paging in more items never double-binds or drops
+    // a handler.
+    historyListEl.addEventListener('click', async (e)=>{
+      const moreOrRetryBtn=e.target.closest('#cb-hist-more, #cb-hist-retry');
+      if(moreOrRetryBtn){
+        moreOrRetryBtn.disabled=true; moreOrRetryBtn.textContent='Loading…';
+        const lastVersion=historyLoadedVersions.length
+          ? historyLoadedVersions[historyLoadedVersions.length-1].version : null;
+        const {items, hasMore, error}=await cloudBackupListVersionHistory(lastVersion);
+        historyLoadError=error||null;
+        if(!error) historyLoadedVersions=historyLoadedVersions.concat(items);
+        historyListEl.dataset.hasMore=hasMore?'1':'0';
+        renderHistoryList();
+        return;
+      }
+      const restoreBtn=e.target.closest('.cb-hist-restore');
+      if(restoreBtn){
+        const v=parseInt(restoreBtn.dataset.version,10);
+        const ok=confirm('This will overwrite your CURRENT local data (tasks, notes, everything) with version '+v+'. This cannot be undone locally. Continue?');
+        if(!ok) return;
+        restoreBtn.disabled=true; restoreBtn.textContent='Restoring…';
+        let extra=null;
+        try{
+          const r=await cloudBackupPullVersion(v);
+          if(r&&r.ok){ toast('Restored version '+v); }
+          else { extra='FAILED — reason: '+JSON.stringify(r); toast('Restore failed, see status below'); }
+        }catch(e){ extra='THREW — '+(e&&e.stack||e); toast('Restore threw, see status below'); }
+        restoreBtn.disabled=false; restoreBtn.textContent='Restore';
+        refreshStatus(extra);
+        try{ render(); }catch(e){}
+      }
+    });
   }
   requestAnimationFrame(()=>ov.classList.add('on'));
   const close=()=>{ov.classList.remove('on');setTimeout(()=>ov.remove(),200);};
