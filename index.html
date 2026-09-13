@@ -26911,31 +26911,36 @@ function openSettingsSheet(){
     const pushBtn=document.getElementById('cb-test-push');
     const pullBtn=document.getElementById('cb-test-pull');
     const statusEl=document.getElementById('cb-test-status');
-    const refreshStatus=()=>{
+    const refreshStatus=(extra)=>{
       const cb=(DB.meta&&DB.meta.cloudBackup)||{};
       const lines=[];
       lines.push('Last backup: '+(cb.lastPushAt?new Date(cb.lastPushAt).toLocaleString():'never'));
       lines.push('Last restore: '+(cb.lastRestoreAt?new Date(cb.lastRestoreAt).toLocaleString():'never'));
       if(cb.lastPushError) lines.push('⚠ Last error: '+esc(cb.lastPushError));
+      if(extra) lines.push('<b style="color:#f43f5e">'+esc(extra)+'</b>');
       if(statusEl) statusEl.innerHTML=lines.join('<br>');
     };
     if(pushBtn) pushBtn.onclick=async()=>{
       pushBtn.disabled=true; pushBtn.textContent='Backing up…';
+      let extra=null;
       try{
         const r=await cloudBackupPush();
-        toast(r&&r.ok?'Backup complete':'Backup failed: '+((r&&r.reason)||'unknown'));
-      }catch(e){ toast('Backup error: '+(e&&e.message||e)); }
+        if(r&&r.ok){ toast('Backup complete'); }
+        else { extra='FAILED — reason: '+JSON.stringify(r); toast('Backup failed, see status below'); }
+      }catch(e){ extra='THREW — '+(e&&e.stack||e); toast('Backup threw, see status below'); }
       pushBtn.disabled=false; pushBtn.textContent='Backup now';
-      refreshStatus();
+      refreshStatus(extra);
     };
     if(pullBtn) pullBtn.onclick=async()=>{
       pullBtn.disabled=true; pullBtn.textContent='Restoring…';
+      let extra=null;
       try{
         const r=await cloudBackupPull();
-        toast(r&&r.ok?'Restore complete':'Restore failed: '+((r&&r.reason)||'unknown'));
-      }catch(e){ toast('Restore error: '+(e&&e.message||e)); }
+        if(r&&r.ok){ toast('Restore complete'); }
+        else { extra='FAILED — reason: '+JSON.stringify(r); toast('Restore failed, see status below'); }
+      }catch(e){ extra='THREW — '+(e&&e.stack||e); toast('Restore threw, see status below'); }
       pullBtn.disabled=false; pullBtn.textContent='Restore now';
-      refreshStatus();
+      refreshStatus(extra);
       try{ render(); }catch(e){}
     };
   }
