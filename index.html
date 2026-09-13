@@ -26876,7 +26876,7 @@ function openSettingsSheet(){
 
       <div class="hub-sec-label">${tr('about')}</div>
       <div class="set-group">
-        <div class="ul-row" style="padding:0 16px;cursor:default">
+        <div class="ul-row" style="padding:0 16px;cursor:pointer" onclick="famDevTap()">
           <div class="ul-icon"><div class="ul-icon-inner" style="background:#6e56f820;color:var(--brand);font-size:16px">i</div></div>
           <span class="ul-name">MBM Life</span>
           <span class="ul-count">${esc(appVersionDisplay())}</span>
@@ -26887,10 +26887,58 @@ function openSettingsSheet(){
         </div>
       </div>
 
+      <div class="hub-sec-label">Cloud Backup (TEST BUILD)</div>
+      <div class="set-group" style="padding:12px 16px">
+        <div id="cb-test-status" style="font-size:11px;color:var(--ink3);margin-bottom:8px">${(()=>{
+          const cb=(DB.meta&&DB.meta.cloudBackup)||{};
+          const lines=[];
+          lines.push('Last backup: '+(cb.lastPushAt?new Date(cb.lastPushAt).toLocaleString():'never'));
+          lines.push('Last restore: '+(cb.lastRestoreAt?new Date(cb.lastRestoreAt).toLocaleString():'never'));
+          if(cb.lastPushError) lines.push('⚠ Last error: '+esc(cb.lastPushError));
+          return lines.join('<br>');
+        })()}</div>
+        <div style="display:flex;gap:8px">
+          <button class="btn btn-ghost" id="cb-test-push" style="flex:1">Backup now</button>
+          <button class="btn btn-ghost" id="cb-test-pull" style="flex:1">Restore now</button>
+        </div>
+      </div>
+
       <div style="padding:6px 14px 24px"><button class="set-signout" data-set="signout">${tr('signOut')}</button></div>
     </div>
     <input type="file" id="acct-file" accept="image/*" style="display:none">`;
   document.body.appendChild(ov);
+  {
+    const pushBtn=document.getElementById('cb-test-push');
+    const pullBtn=document.getElementById('cb-test-pull');
+    const statusEl=document.getElementById('cb-test-status');
+    const refreshStatus=()=>{
+      const cb=(DB.meta&&DB.meta.cloudBackup)||{};
+      const lines=[];
+      lines.push('Last backup: '+(cb.lastPushAt?new Date(cb.lastPushAt).toLocaleString():'never'));
+      lines.push('Last restore: '+(cb.lastRestoreAt?new Date(cb.lastRestoreAt).toLocaleString():'never'));
+      if(cb.lastPushError) lines.push('⚠ Last error: '+esc(cb.lastPushError));
+      if(statusEl) statusEl.innerHTML=lines.join('<br>');
+    };
+    if(pushBtn) pushBtn.onclick=async()=>{
+      pushBtn.disabled=true; pushBtn.textContent='Backing up…';
+      try{
+        const r=await cloudBackupPush();
+        toast(r&&r.ok?'Backup complete':'Backup failed: '+((r&&r.reason)||'unknown'));
+      }catch(e){ toast('Backup error: '+(e&&e.message||e)); }
+      pushBtn.disabled=false; pushBtn.textContent='Backup now';
+      refreshStatus();
+    };
+    if(pullBtn) pullBtn.onclick=async()=>{
+      pullBtn.disabled=true; pullBtn.textContent='Restoring…';
+      try{
+        const r=await cloudBackupPull();
+        toast(r&&r.ok?'Restore complete':'Restore failed: '+((r&&r.reason)||'unknown'));
+      }catch(e){ toast('Restore error: '+(e&&e.message||e)); }
+      pullBtn.disabled=false; pullBtn.textContent='Restore now';
+      refreshStatus();
+      try{ render(); }catch(e){}
+    };
+  }
   requestAnimationFrame(()=>ov.classList.add('on'));
   const close=()=>{ov.classList.remove('on');setTimeout(()=>ov.remove(),200);};
 
