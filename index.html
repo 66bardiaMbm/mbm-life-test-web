@@ -3129,6 +3129,95 @@ async function _cloudBackupFetchVersionEntities(uid, version, expectedCounts){
   return {restoredEntities, restoredMeta:metaSnap.data()};
 }
 
+// v[TEST BUILD BUGFIX 7] Previously chunked into multiple 400-op
+// batch.commit() calls — each commit is atomic on its OWN, but the
+// SEQUENCE of several commits is not: a later chunk failing after an
+// earlier one already landed left the server genuinely half-restored,
+// with no way to detect or undo it from here. Firestore's real
+// per-batch cap is 500 writes; this now does the ENTIRE reconcile as
+// ONE batch (all sets and deletes together) so it is genuinely
+// all-or-nothing at the server. If the total wouldn't fit in one batch,
+// this refuses BEFORE issuing a single write and says so plainly —
+// it does not attempt a partial reconcile. (This does not add any
+// cross-device write lock — a genuinely concurrent edit from another
+// signed-in device during this window is still possible and is not
+// protected against; that remains a disclosed, unresolved limitation.)
+async function _cloudBackupReconcileLiveSync(restoredEntities){
+  if(!FB.ready || !FB.user) return; // no live session to reconcile against
+  if(typeof sessionCap==='function' && !sessionCap('sync')) return;
+  const ws=wsId(FB.user.uid);
+  const db=FB.db;
+  const liveTypes=['tasks','lists','appts'];
+  let ops=[]; // {type:'set'|'delete', ref, data?} — read-only accumulation, no writes yet
+
+  for(const type of liveTypes){
+    const col=db.collection('workspaces').doc(ws).collection(type);
+    const liveSnap=await col.get();
+    const restoredMap=restoredEntities[type]||{};
+    const keepIds=new Set(Object.keys(restoredMap));
+    liveSnap.forEach(doc=>{ if(!keepIds.has(doc.id)) ops.push({type:'delete', ref:doc.ref}); });
+    for(const item of Object.values(restoredMap)){
+      if(item && item.id) ops.push({type:'set', ref:col.doc(item.id), data:item});
+    }
+  }
+
+  const FIRESTORE_BATCH_LIMIT=500;
+  if(ops.length>FIRESTORE_BATCH_LIMIT){
+    throw new Error(`restore-too-large-for-atomic-sync: this restore needs ${ops.length} live-sync changes, over the ${FIRESTORE_BATCH_LIMIT}-per-batch limit this test build restores atomically. Nothing was written. Restoring a version closer to your current data (fewer changed items) should fit.`);
+  }
+  if(ops.length===0) return; // nothing to reconcile — restored version already matches live exactly
+
+  const batch=db.batch();
+  for(const op of ops){
+    if(op.type==='delete') batch.delete(op.ref); else batch.set(op.ref, op.data);
+  }
+  await batch.commit(); // single atomic commit — all-or-nothing at the server
+}
+
+// v[TEST BUILD BUGFIX] persistDB() is fire-and-forget by design (used
+// everywhere else in the app for ordinary autosave, where that's fine).
+// For a RESTORE specifically, reporting success before the local write
+// is actually confirmed on disk is misleading — the reconcile finishing
+// says nothing about whether IndexedDB itself finished. This awaits the
+// real underlying write and returns whether it actually succeeded,
+// mirroring persistDB()'s own IndexedDB→localStorage fallback exactly.
+//
+// v[TEST BUILD BUGFIX 4] The _savedAt bump above (BUGFIX 3) only helps
+// when the device clock actually moves forward between saves — reviewer
+// reproduced the SAME failure with an equal or backward-moved clock,
+// which is a real, pre-existing fragility of comparing wall-clock
+// timestamps at all (idbMigrateAndLoad() does this for EVERY save in
+// the app, not just restores — fixing that generally needs a monotonic
+// counter shared across all saves, which is out of scope here: it's an
+// app-wide boot-comparison change, not a restore-path fix). What IS in
+// scope: make the comparison IRRELEVANT for restores specifically, by
+// keeping both stores identical. Previously localStorage was written
+// ONLY as a fallback when IndexedDB failed; now it's ALSO written right
+// after a successful IndexedDB save. When both stores hold the exact
+// same restored content, it no longer matters which one idbMigrateAndLoad()
+// picks at next boot — clock skew can no longer cause the restore to be
+// silently discarded. This does not fix the app's general timestamp-
+// comparison fragility elsewhere; it only removes it as a factor here.
+async function _cloudBackupPersistLocalAwaited(){
+  bumpSaveStamp();
+  if(idbReady && _idbHandle){
+    try{
+      await idbSet(IDB_BLOB_KEY, DB);
+      try{ localStorage.setItem(KEY, JSON.stringify(DB)); }catch(e){} // best-effort mirror — keeps loadDB()'s synchronous read in sync too
+      try{ clearSaveError(); }catch(e){}
+      return true;
+    }
+    catch(e){
+      console.error('IndexedDB save failed, falling back to localStorage:', e);
+      try{ localStorage.setItem(KEY, JSON.stringify(DB)); try{ clearSaveError(); }catch(e2){} return true; }
+      catch(e2){ try{ showSaveError(L==='fa'?'⚠ ذخیره‌سازی ناموفق بود — فضای ذخیره‌ی دستگاه پر است.':'⚠ Save failed — device storage may be full.'); }catch(e3){} return false; }
+    }
+  }else{
+    try{ localStorage.setItem(KEY, JSON.stringify(DB)); try{ clearSaveError(); }catch(e){} return true; }
+    catch(e){ try{ showSaveError(L==='fa'?'⚠ ذخیره‌سازی ناموفق بود — فضای ذخیره‌ی دستگاه پر است.':'⚠ Save failed — device storage may be full.'); }catch(e2){} return false; }
+  }
+}
+
 async function cloudBackupPull(){
   const uid=cloudBackupUid();
   if(!uid) return {ok:false, reason:'not-signed-in'};
@@ -3139,20 +3228,44 @@ async function cloudBackupPull(){
   const gate=cloudBackupCanRestore(cloudManifest);
   if(!gate.allowed) return {ok:false, reason:gate.reason};
 
+  // v[TEST BUILD BUGFIX 2] Ordering fixed: reconcile the SERVER-side
+  // live-sync collections FIRST, using the restored data — and only if
+  // that fully succeeds do we touch this device's own DB.entities and
+  // local storage. Previously local state was changed BEFORE the
+  // reconcile ran, so a reconcile failure left local data already
+  // mutated (and, worse, still reported {ok:true} — the try/catch around
+  // the reconcile call swallowed its own error instead of surfacing it).
+  // Now: if reconcile throws, we return ok:false having changed NOTHING
+  // locally — restartListeners() in `finally` then re-syncs this device
+  // from whatever the server actually ended up with, so even a partially
+  // -committed server reconcile (a later batch failing after an earlier
+  // one succeeded — see _cloudBackupReconcileLiveSync's own 400-op-per-
+  // batch comment) converges this device back to the server's real state
+  // instead of leaving it stuck on a version nothing else agrees with.
+  try{ stopListeners(); }catch(e){}
   try{
     const {restoredEntities, restoredMeta}=await _cloudBackupFetchVersionEntities(uid, cloudManifest.version, cloudManifest.entityCounts);
+    await _cloudBackupReconcileLiveSync(restoredEntities); // throws on failure — nothing local touched yet
     // Replacing DB.entities wholesale is now safe — every type above
     // either matched its expected count exactly or threw, so there is no
     // path left where a silently-empty collection could reach this line.
     DB.entities=Object.assign(blankDB().entities, restoredEntities);
     for(const k of CLOUD_BACKUP_META_FIELDS){ if(k in restoredMeta) DB.meta[k]=restoredMeta[k]; }
     DB.meta.cloudBackup=Object.assign({}, DB.meta.cloudBackup, {cloudBackupLastSyncedVersion:cloudManifest.version, lastRestoreAt:new Date().toISOString(), lastRestoredVersion:cloudManifest.version});
-    persistDB(true); // true: nothing new to push right after a pull, and a pointless immediate push would just waste quota
+    // Awaited on purpose (see _cloudBackupPersistLocalAwaited) — a
+    // restore reporting success before the write is actually confirmed
+    // on disk would be misleading, unlike ordinary autosave elsewhere.
+    const savedOk=await _cloudBackupPersistLocalAwaited();
+    if(!savedOk) return {ok:false, reason:'local-save-failed'}; // server already has the restored data; startListeners() below will re-pull it onto this device
     try{ if(typeof applyTheme==='function') applyTheme(); }catch(e){}
     return {ok:true, version:cloudManifest.version};
   }catch(e){
     console.error('cloudBackupPull failed:', e);
     return {ok:false, reason:'pull-failed', error:String(e&&e.message||e)};
+  }finally{
+    // Always resume — a failure above must never leave this device
+    // silently un-synced until the next full reboot.
+    try{ if(FB.user) startListeners(); }catch(e){}
   }
 }
 
@@ -3176,18 +3289,23 @@ async function cloudBackupPullVersion(version){
     historyDoc=hSnap.data();
   }catch(e){ return {ok:false, reason:'read-manifest-failed'}; }
 
+  try{ stopListeners(); }catch(e){}
   try{
     const {restoredEntities, restoredMeta}=await _cloudBackupFetchVersionEntities(uid, version, historyDoc.entityCounts);
+    await _cloudBackupReconcileLiveSync(restoredEntities); // throws on failure — nothing local touched yet
     DB.entities=Object.assign(blankDB().entities, restoredEntities);
     for(const k of CLOUD_BACKUP_META_FIELDS){ if(k in restoredMeta) DB.meta[k]=restoredMeta[k]; }
     const ackVersion=(liveManifest && typeof liveManifest.version==='number') ? liveManifest.version : version;
     DB.meta.cloudBackup=Object.assign({}, DB.meta.cloudBackup, {cloudBackupLastSyncedVersion:ackVersion, lastRestoreAt:new Date().toISOString(), lastRestoredVersion:version});
-    persistDB(true);
+    const savedOk=await _cloudBackupPersistLocalAwaited();
+    if(!savedOk) return {ok:false, reason:'local-save-failed'}; // server already has the restored data; startListeners() below will re-pull it onto this device
     try{ if(typeof applyTheme==='function') applyTheme(); }catch(e){}
     return {ok:true, version:version};
   }catch(e){
     console.error('cloudBackupPullVersion failed:', e);
     return {ok:false, reason:'pull-failed', error:String(e&&e.message||e)};
+  }finally{
+    try{ if(FB.user) startListeners(); }catch(e){}
   }
 }
 
@@ -3422,9 +3540,22 @@ function loadDB(){
     return d;
   }catch(e){return seedDB(blankDB());}
 }
-function saveDB(){
+// v[TEST BUILD BUGFIX 5] REPRODUCED BUG (equal/backward clock cases):
+// wall-clock timestamps are not a reliable ordering signal at all — a
+// device clock can tie or move backward (DST, manual adjustment, NTP
+// correction), and idbMigrateAndLoad()'s freshness check has no way to
+// tell "genuinely older" apart from "clock briefly went backward" using
+// _savedAt alone. _saveSeq is a plain integer, incremented on every save
+// from BOTH the normal edit path (saveDB()) and the restore path — it
+// only ever moves forward, so it stays correct regardless of what the
+// system clock does. idbMigrateAndLoad() below now compares THIS first,
+// falling back to _savedAt only for data saved before this field existed.
+function bumpSaveStamp(){
   DB.meta._savedAt=new Date().toISOString();
-  persistDB();
+  DB.meta._saveSeq=((DB.meta&&typeof DB.meta._saveSeq==='number')?DB.meta._saveSeq:0)+1;
+}
+function saveDB(){
+  persistDB(); // bumps _savedAt/_saveSeq internally now (see persistDB's own comment)
   if(typeof syncPush==='function')syncPush();
 }
 
@@ -3527,7 +3658,22 @@ function downloadJSONBackup(dataObj,filenamePrefix){
 // The one function every write path calls. Primary store = IndexedDB.
 // localStorage is kept ONLY as a last-resort fallback for browsers without
 // IndexedDB (or if a write genuinely fails), and failures are now visible.
+// v[TEST BUILD BUGFIX 6] REPRODUCED GAP: bumpSaveStamp() was only called
+// by saveDB() and the restore path — but persistDB() itself is called
+// directly from ~40 other sites throughout the app (family location
+// updates, road-report listeners, driving sessions, live onSnapshot
+// callbacks, etc. — see e.g. lines ~14696, ~14858, ~15067, ~16283) that
+// never go through saveDB() at all. Those writes DID change IndexedDB's
+// actual content, but never advanced _saveSeq/_savedAt — so the boot
+// comparison could still pick the WRONG store for those paths even
+// after BUGFIX 5, defeating the point of a "monotonic" counter that
+// wasn't actually bumped on every real write. Moving the bump INSIDE
+// persistDB() itself — the one genuinely shared low-level writer this
+// file's own comment above already describes as "EVERY write path" —
+// means every caller, known or not, advances the same counter before
+// its write lands, with no per-call-site opt-in required.
 function persistDB(skipCloudBackupSchedule){
+  bumpSaveStamp();
   if(idbReady && _idbHandle){
     idbSet(IDB_BLOB_KEY,DB).then(()=>clearSaveError()).catch(e=>{
       console.error('IndexedDB save failed, falling back to localStorage:',e);
@@ -3574,9 +3720,23 @@ async function idbMigrateAndLoad(){
   try{
     const existing=await idbGet(IDB_BLOB_KEY);
     if(existing && existing.entities){
-      const idbTime=(existing.meta&&existing.meta._savedAt)||'';
-      const curTime=(DB.meta&&DB.meta._savedAt)||'';
-      if(idbTime>=curTime){
+      // v[TEST BUILD BUGFIX 5] Prefer the monotonic _saveSeq counter over
+      // the wall-clock _savedAt string — a device clock tying or moving
+      // backward made this comparison pick the wrong store (see
+      // bumpSaveStamp()'s comment). Falls back to the old timestamp-only
+      // behavior only for data saved before _saveSeq existed on either
+      // side, so nothing already-saved breaks.
+      const idbSeq=(existing.meta&&typeof existing.meta._saveSeq==='number')?existing.meta._saveSeq:null;
+      const curSeq=(DB.meta&&typeof DB.meta._saveSeq==='number')?DB.meta._saveSeq:null;
+      let idbWins;
+      if(idbSeq!==null && curSeq!==null){
+        idbWins=idbSeq>=curSeq;
+      }else{
+        const idbTime=(existing.meta&&existing.meta._savedAt)||'';
+        const curTime=(DB.meta&&DB.meta._savedAt)||'';
+        idbWins=idbTime>=curTime;
+      }
+      if(idbWins){
         DB.entities=existing.entities;
         // Never let a stale IDB copy override the auth identity of the
         // session currently signing in.
@@ -27064,7 +27224,7 @@ function openSettingsSheet(){
       refreshStatus(extra);
     };
     if(pullBtn) pullBtn.onclick=async()=>{
-      const ok=confirm('This will overwrite your CURRENT local data (tasks, notes, everything) with the latest cloud backup. This cannot be undone locally. Continue?');
+      const ok=confirm('This will overwrite your CURRENT data (tasks, notes, everything) — on THIS device and in shared/synced storage — with the latest cloud backup. If another device is editing right now, its changes could be lost. This cannot be undone locally. Continue?');
       if(!ok) return;
       pullBtn.disabled=true; pullBtn.textContent='Restoring…';
       let extra=null;
@@ -27158,7 +27318,7 @@ function openSettingsSheet(){
       const restoreBtn=e.target.closest('.cb-hist-restore');
       if(restoreBtn){
         const v=parseInt(restoreBtn.dataset.version,10);
-        const ok=confirm('This will overwrite your CURRENT local data (tasks, notes, everything) with version '+v+'. This cannot be undone locally. Continue?');
+        const ok=confirm('This will overwrite your CURRENT data (tasks, notes, everything) — on THIS device and in shared/synced storage — with version '+v+'. If another device is editing right now, its changes could be lost. This cannot be undone locally. Continue?');
         if(!ok) return;
         restoreBtn.disabled=true; restoreBtn.textContent='Restoring…';
         let extra=null;
