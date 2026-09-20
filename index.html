@@ -2211,7 +2211,7 @@ try{
     });
   });
 }catch(e){}
-const APP_VERSION='v591';
+const APP_VERSION='v593';
 const SCHEMA=1;
 const KEY='mbmlife_platform_v1';
 /* Global: true when running inside the MBM Life Android companion WebView
@@ -2829,6 +2829,14 @@ function cloudBackupBuildMetaPayload(meta){
 async function cloudBackupPush(){
   const uid=cloudBackupUid();
   if(!uid) return {ok:false, reason:'not-signed-in'};
+  // Fix (Codex review round 2, finding 5, second half): capture the save
+  // sequence NOW, at the moment this snapshot is taken — not at upload
+  // completion. The push below can take a while (attachment uploads,
+  // multiple awaits); if a real edit lands and bumps _saveSeq DURING
+  // that window, reading _saveSeq fresh at the end would record a value
+  // higher than what this snapshot actually contains, and Guard A would
+  // then wrongly believe that later edit is already safely backed up.
+  const _saveSeqAtSnapshotTime = (typeof DB.meta._saveSeq==='number') ? DB.meta._saveSeq : 0;
   const localMeta=(DB.meta.cloudBackup)||{};
   let cloudManifest=null;
   try{ cloudManifest=await cloudBackupReadManifest(uid); }
@@ -3027,7 +3035,7 @@ async function cloudBackupPush(){
       });
     });
 
-    DB.meta.cloudBackup=Object.assign({}, DB.meta.cloudBackup, {cloudBackupLastSyncedVersion:nextVersion, lastPushAt:new Date().toISOString(), lastPushError:null});
+    DB.meta.cloudBackup=Object.assign({}, DB.meta.cloudBackup, {cloudBackupLastSyncedVersion:nextVersion, lastPushAt:new Date().toISOString(), lastPushError:null, lastPushedSaveSeq:_saveSeqAtSnapshotTime});
     // v[next] FIX (code review round 2, 2026-09-08): a successful push
     // updated DB.meta.cloudBackup only in memory — with no persistDB()
     // call here, reopening the app (a fresh JS environment reloading DB
@@ -3142,37 +3150,143 @@ async function _cloudBackupFetchVersionEntities(uid, version, expectedCounts){
 // cross-device write lock — a genuinely concurrent edit from another
 // signed-in device during this window is still possible and is not
 // protected against; that remains a disclosed, unresolved limitation.)
-async function _cloudBackupReconcileLiveSync(restoredEntities){
-  if(!FB.ready || !FB.user) return; // no live session to reconcile against
-  if(typeof sessionCap==='function' && !sessionCap('sync')) return;
-  const ws=wsId(FB.user.uid);
-  const db=FB.db;
-  const liveTypes=['tasks','lists','appts'];
-  let ops=[]; // {type:'set'|'delete', ref, data?} — read-only accumulation, no writes yet
+/* v[next] Restore reconciliation — safe mode (design v3, this session).
+   Replaces the old _cloudBackupReconcileLiveSync. See
+   concurrency-safety-design-proposal.md. */
+// ═══════════════════════════════════════════════════════════════════════
+// RESTORE reconciliation for live types (tasks/lists/appts) — safe mode.
+// Never auto-deletes (no reliable signal distinguishes "genuinely deleted
+// before backup" from "just missing from this device's stale local copy" —
+// see design doc). Never silently overwrites a live item that changed
+// since the backup snapshot — detects and queues the conflict instead.
+// ═══════════════════════════════════════════════════════════════════════
 
-  for(const type of liveTypes){
-    const col=db.collection('workspaces').doc(ws).collection(type);
-    const liveSnap=await col.get();
-    const restoredMap=restoredEntities[type]||{};
-    const keepIds=new Set(Object.keys(restoredMap));
-    liveSnap.forEach(doc=>{ if(!keepIds.has(doc.id)) ops.push({type:'delete', ref:doc.ref}); });
-    for(const item of Object.values(restoredMap)){
-      if(item && item.id) ops.push({type:'set', ref:col.doc(item.id), data:item});
+async function _cloudBackupReconcileLiveSyncSafe(restoredEntities){
+  const owner=cloudBackupUid();
+  if(!owner) return {ok:false,reason:'not-signed-in'};
+  _ensureSyncQueues();
+  const cb=DB.meta.cloudBackup;
+  if(!cb.restoreOperations) cb.restoreOperations=[];
+  const accepted={},conflictedKeys=[];
+  let applied=0,conflicted=0;
+  for(const type of LIVE_SYNC_TYPES) for(const [id,restored] of Object.entries((restoredEntities||{})[type]||{})){
+    const ref=FB.db.collection('workspaces').doc(wsId(owner)).collection(type).doc(id);
+    const operation=_csOperation(restored,restored._v,restored._syncBase,owner);
+    operation.entityType=type;operation.id=id;
+    cb.restoreOperations.push(operation);
+    try{
+      const pending=cb.pendingChanges.some(e=>e.ownerUid===owner&&e.entityType===type&&e.id===id);
+      if(pending){const snap=await ref.get({source:'server'});throw Object.assign(new Error('local-change-pending'),{serverSnapshot:snap.exists?snap.data():null});}
+      if(!await _csPersist()) throw new Error('local-save-failed');
+      const result=await _csCommit(ref,operation);
+      if(cloudBackupUid()!==owner) throw new Error('account-changed');
+      if(!accepted[type]) accepted[type]={};accepted[type][id]=_csAdopt(result.serverItem);applied++;
+      operation.committed=true;
+    }catch(e){
+      if(cloudBackupUid()!==owner) return {ok:false,reason:'account-changed',applied,conflicted,conflictedKeys,accepted};
+      conflicted++;conflictedKeys.push({type,id});
+      cb.conflicts.push({conflictId:_csId(),ownerUid:owner,entityType:type,id,source:'restore',backupItem:_csCopy(restored),currentLocalItem:_csCopy((DB.entities[type]||{})[id])||null,serverItem:_csCopy(e.serverSnapshot)||null,error:e.message,operation:_csCopy(operation),detectedAt:new Date().toISOString()});
     }
   }
-
-  const FIRESTORE_BATCH_LIMIT=500;
-  if(ops.length>FIRESTORE_BATCH_LIMIT){
-    throw new Error(`restore-too-large-for-atomic-sync: this restore needs ${ops.length} live-sync changes, over the ${FIRESTORE_BATCH_LIMIT}-per-batch limit this test build restores atomically. Nothing was written. Restoring a version closer to your current data (fewer changed items) should fit.`);
-  }
-  if(ops.length===0) return; // nothing to reconcile — restored version already matches live exactly
-
-  const batch=db.batch();
-  for(const op of ops){
-    if(op.type==='delete') batch.delete(op.ref); else batch.set(op.ref, op.data);
-  }
-  await batch.commit(); // single atomic commit — all-or-nothing at the server
+  const saved=await _csPersist();
+  if(saved){cb.restoreOperations=cb.restoreOperations.filter(op=>!op.committed);}
+  return {ok:conflicted===0&&saved,applied,conflicted,conflictedKeys,accepted};
 }
+
+// ── "Exact restore" mode: opt-in, shows what would be REMOVED (items live
+// now but absent from the chosen backup), requires explicit confirmation.
+// Point 4's re-validation requirement: the preview is a snapshot in time:
+// between showing it and the user pressing confirm, the live data could
+// have changed again. buildExactRestorePreview() and
+// executeExactRestoreIfPreviewStillValid() are deliberately separate so
+// the caller can re-run the SAME preview check right before acting, and
+// abort (re-show a fresh preview) if anything drifted.
+async function buildExactRestorePreview(restoredEntities){
+  const uid = cloudBackupUid();
+  const ws = wsId(uid);
+  const toRemove = [];
+  const liveVAtPreviewTime = {}; // captured so we can detect drift later
+  for(const type of LIVE_SYNC_TYPES){
+    const restoredIds = new Set(Object.keys((restoredEntities&&restoredEntities[type])||{}));
+    const liveSnap = await FB.db.collection('workspaces').doc(ws).collection(type).get();
+    liveSnap.forEach(doc=>{
+      liveVAtPreviewTime[type+'/'+doc.id] = (typeof doc.data()._v==='number')?doc.data()._v:null;
+      if(!restoredIds.has(doc.id)) toRemove.push({entityType:type, id:doc.id, item:doc.data()});
+    });
+  }
+  return {toRemove, liveVAtPreviewTime, builtAt:new Date().toISOString()};
+}
+
+async function executeExactRestoreIfPreviewStillValid(preview){
+  // Fix (Codex review round 2, static finding 8a/8b): disabled at the
+  // code level, not just by the Rules. Real deletion for these entity
+  // types has no server-enforced revision protocol yet (a delete request
+  // carries no payload to check a version claim against), and this
+  // function's own per-item delete loop still has a partial-outcome gap
+  // (finding 8b) that hasn't been redesigned. Nothing in the app calls
+  // this — it stays explicitly refused until both are addressed, rather
+  // than left to fail confusingly deep inside a transaction.
+  return {ok:false, reason:'exact-restore-disabled', detail:'Hard deletion for live-synced items has no server-enforced protocol yet; this path is intentionally disabled. See design doc, open item 8.'};
+
+  const uid = cloudBackupUid();
+  const ws = wsId(uid);
+  // Fix (Codex review, regression 6): the previous version validated ALL
+  // items first, then deleted them in a SEPARATE later loop — leaving a
+  // real window between "confirmed safe" and "actually removed" where a
+  // concurrent edit could land undetected (demonstrated: an edit right
+  // after validation still got deleted). Each item's check-and-delete is
+  // now a single atomic transaction — there is no gap between them for
+  // this specific item. If any item has drifted since the preview, the
+  // whole operation stops immediately; items already removed in this
+  // same call stay removed (no automatic undo), and the caller is told
+  // exactly how far it got.
+  let removed = 0;
+  for(const entry of preview.toRemove){
+    const key = entry.entityType+'/'+entry.id;
+    const expectedV = preview.liveVAtPreviewTime[key];
+    const ref = FB.db.collection('workspaces').doc(ws).collection(entry.entityType).doc(entry.id);
+    try{
+      let outcome;
+      await FB.db.runTransaction(async (tx)=>{
+        const snap = await tx.get(ref);
+        const currentV = snap.exists ? (typeof snap.data()._v==='number'?snap.data()._v:null) : null;
+        if(currentV !== expectedV){ outcome='stale'; return; }
+        tx.delete(ref);
+        outcome='deleted';
+      });
+      if(outcome==='stale'){
+        return {ok:false, reason:'preview-stale', changedItem:key, removedBeforeStop:removed};
+      }
+      removed++;
+    }catch(e){
+      return {ok:false, reason:'delete-failed', changedItem:key, error:e&&e.message, removedBeforeStop:removed};
+    }
+  }
+  return {ok:true, removed};
+}
+
+// ── Guard A: protective auto-backup before Restore, as a HARD precondition.
+// If this device has local edits not yet confirmed synced, Restore must
+// not proceed until a real backup of the CURRENT state succeeds — that
+// backup is what "preserves changes until the user decides" for the
+// same-device case. If the protective backup itself fails, Restore stops
+// here; it never proceeds without this safety net.
+async function guardedRestore(doRestoreFn){
+  _ensureSyncQueues();
+  const hasUnsyncedLocalWork =
+    DB.meta.cloudBackup.pendingChanges.length > 0 ||
+    (typeof DB.meta._saveSeq==='number' && typeof DB.meta.cloudBackup.lastPushedSaveSeq==='number'
+      && DB.meta._saveSeq > DB.meta.cloudBackup.lastPushedSaveSeq);
+
+  if(hasUnsyncedLocalWork){
+    const backupResult = await cloudBackupPush();
+    if(!backupResult || backupResult.ok!==true){
+      return {ok:false, reason:'protective-backup-failed', detail:backupResult};
+    }
+  }
+  return await doRestoreFn();
+}
+
 
 // v[TEST BUILD BUGFIX] persistDB() is fire-and-forget by design (used
 // everywhere else in the app for ordinary autosave, where that's fine).
@@ -3200,73 +3314,42 @@ async function _cloudBackupReconcileLiveSync(restoredEntities){
 // comparison fragility elsewhere; it only removes it as a factor here.
 async function _cloudBackupPersistLocalAwaited(){
   bumpSaveStamp();
+  const savedSnapshot=JSON.parse(JSON.stringify(DB));
   if(idbReady && _idbHandle){
     try{
-      await idbSet(IDB_BLOB_KEY, DB);
-      try{ localStorage.setItem(KEY, JSON.stringify(DB)); }catch(e){} // best-effort mirror — keeps loadDB()'s synchronous read in sync too
+      await idbSet(IDB_BLOB_KEY, savedSnapshot);
+      try{ localStorage.setItem(KEY, JSON.stringify(savedSnapshot)); }catch(e){} // best-effort mirror — keeps loadDB()'s synchronous read in sync too
       try{ clearSaveError(); }catch(e){}
       return true;
     }
     catch(e){
       console.error('IndexedDB save failed, falling back to localStorage:', e);
-      try{ localStorage.setItem(KEY, JSON.stringify(DB)); try{ clearSaveError(); }catch(e2){} return true; }
+      try{ localStorage.setItem(KEY, JSON.stringify(savedSnapshot)); try{ clearSaveError(); }catch(e2){} return true; }
       catch(e2){ try{ showSaveError(L==='fa'?'⚠ ذخیره‌سازی ناموفق بود — فضای ذخیره‌ی دستگاه پر است.':'⚠ Save failed — device storage may be full.'); }catch(e3){} return false; }
     }
   }else{
-    try{ localStorage.setItem(KEY, JSON.stringify(DB)); try{ clearSaveError(); }catch(e){} return true; }
+    try{ localStorage.setItem(KEY, JSON.stringify(savedSnapshot)); try{ clearSaveError(); }catch(e){} return true; }
     catch(e){ try{ showSaveError(L==='fa'?'⚠ ذخیره‌سازی ناموفق بود — فضای ذخیره‌ی دستگاه پر است.':'⚠ Save failed — device storage may be full.'); }catch(e2){} return false; }
   }
 }
 
 async function cloudBackupPull(){
-  const uid=cloudBackupUid();
-  if(!uid) return {ok:false, reason:'not-signed-in'};
-  let cloudManifest=null;
-  try{ cloudManifest=await cloudBackupReadManifest(uid); }
-  catch(e){ return {ok:false, reason:'read-manifest-failed'}; }
-
-  const gate=cloudBackupCanRestore(cloudManifest);
-  if(!gate.allowed) return {ok:false, reason:gate.reason};
-
-  // v[TEST BUILD BUGFIX 2] Ordering fixed: reconcile the SERVER-side
-  // live-sync collections FIRST, using the restored data — and only if
-  // that fully succeeds do we touch this device's own DB.entities and
-  // local storage. Previously local state was changed BEFORE the
-  // reconcile ran, so a reconcile failure left local data already
-  // mutated (and, worse, still reported {ok:true} — the try/catch around
-  // the reconcile call swallowed its own error instead of surfacing it).
-  // Now: if reconcile throws, we return ok:false having changed NOTHING
-  // locally — restartListeners() in `finally` then re-syncs this device
-  // from whatever the server actually ended up with, so even a partially
-  // -committed server reconcile (a later batch failing after an earlier
-  // one succeeded — see _cloudBackupReconcileLiveSync's own 400-op-per-
-  // batch comment) converges this device back to the server's real state
-  // instead of leaving it stuck on a version nothing else agrees with.
-  try{ stopListeners(); }catch(e){}
-  try{
-    const {restoredEntities, restoredMeta}=await _cloudBackupFetchVersionEntities(uid, cloudManifest.version, cloudManifest.entityCounts);
-    await _cloudBackupReconcileLiveSync(restoredEntities); // throws on failure — nothing local touched yet
-    // Replacing DB.entities wholesale is now safe — every type above
-    // either matched its expected count exactly or threw, so there is no
-    // path left where a silently-empty collection could reach this line.
-    DB.entities=Object.assign(blankDB().entities, restoredEntities);
-    for(const k of CLOUD_BACKUP_META_FIELDS){ if(k in restoredMeta) DB.meta[k]=restoredMeta[k]; }
-    DB.meta.cloudBackup=Object.assign({}, DB.meta.cloudBackup, {cloudBackupLastSyncedVersion:cloudManifest.version, lastRestoreAt:new Date().toISOString(), lastRestoredVersion:cloudManifest.version});
-    // Awaited on purpose (see _cloudBackupPersistLocalAwaited) — a
-    // restore reporting success before the write is actually confirmed
-    // on disk would be misleading, unlike ordinary autosave elsewhere.
-    const savedOk=await _cloudBackupPersistLocalAwaited();
-    if(!savedOk) return {ok:false, reason:'local-save-failed'}; // server already has the restored data; startListeners() below will re-pull it onto this device
-    try{ if(typeof applyTheme==='function') applyTheme(); }catch(e){}
-    return {ok:true, version:cloudManifest.version};
-  }catch(e){
-    console.error('cloudBackupPull failed:', e);
-    return {ok:false, reason:'pull-failed', error:String(e&&e.message||e)};
-  }finally{
-    // Always resume — a failure above must never leave this device
-    // silently un-synced until the next full reboot.
-    try{ if(FB.user) startListeners(); }catch(e){}
+  const uid=cloudBackupUid();if(!uid)return {ok:false,reason:'not-signed-in'};
+  let manifest;
+  try{manifest=await cloudBackupReadManifest(uid);}catch(e){return {ok:false,reason:'read-manifest-failed'};}
+  const gate=cloudBackupCanRestore(manifest);if(!gate.allowed)return {ok:false,reason:gate.reason};
+  _ensureSyncQueues();
+  if(FB._syncInFlight||FB._resolutionInFlight||FB._restoreInFlight||(FB._syncTransactions&&FB._syncTransactions.size))return {ok:false,reason:'operation-in-progress'};
+  let ackVersion=manifest.version;
+  const cb=DB.meta.cloudBackup;
+  if(cb.pendingChanges.length || (typeof cb.lastPushedSaveSeq==='number'&&DB.meta._saveSeq>cb.lastPushedSaveSeq)){
+    const protection=await cloudBackupPush();
+    if(!protection||!protection.ok)return {ok:false,reason:'protective-backup-failed'};
+    // Acknowledge only this operation's own committed version, never a later device's head.
+    if(typeof protection.version!=='number')return {ok:false,reason:'protective-version-unknown'};
+    ackVersion=protection.version;
   }
+  return _csApplyRestore(uid,manifest,ackVersion);
 }
 
 // v[TEST BUILD] Restore a SPECIFIC past version the user hand-picked from
@@ -3279,34 +3362,25 @@ async function cloudBackupPull(){
 // becomes local; the device's push eligibility stays tied to the latest
 // known cloud state, which it has now explicitly acknowledged.
 async function cloudBackupPullVersion(version){
-  const uid=cloudBackupUid();
-  if(!uid) return {ok:false, reason:'not-signed-in'};
-  let liveManifest=null, historyDoc=null;
+  const uid=cloudBackupUid();if(!uid)return {ok:false,reason:'not-signed-in'};
+  if(FB._syncInFlight||FB._resolutionInFlight||FB._restoreInFlight||(FB._syncTransactions&&FB._syncTransactions.size))return {ok:false,reason:'operation-in-progress'};
+  let live,manifest;
   try{
-    liveManifest=await cloudBackupReadManifest(uid);
-    const hSnap=await FB.db.collection('users').doc(uid).collection('backup').doc('historyIndex').collection('versions').doc(String(version)).get();
-    if(!hSnap.exists) return {ok:false, reason:'version-not-found'};
-    historyDoc=hSnap.data();
-  }catch(e){ return {ok:false, reason:'read-manifest-failed'}; }
-
-  try{ stopListeners(); }catch(e){}
-  try{
-    const {restoredEntities, restoredMeta}=await _cloudBackupFetchVersionEntities(uid, version, historyDoc.entityCounts);
-    await _cloudBackupReconcileLiveSync(restoredEntities); // throws on failure — nothing local touched yet
-    DB.entities=Object.assign(blankDB().entities, restoredEntities);
-    for(const k of CLOUD_BACKUP_META_FIELDS){ if(k in restoredMeta) DB.meta[k]=restoredMeta[k]; }
-    const ackVersion=(liveManifest && typeof liveManifest.version==='number') ? liveManifest.version : version;
-    DB.meta.cloudBackup=Object.assign({}, DB.meta.cloudBackup, {cloudBackupLastSyncedVersion:ackVersion, lastRestoreAt:new Date().toISOString(), lastRestoredVersion:version});
-    const savedOk=await _cloudBackupPersistLocalAwaited();
-    if(!savedOk) return {ok:false, reason:'local-save-failed'}; // server already has the restored data; startListeners() below will re-pull it onto this device
-    try{ if(typeof applyTheme==='function') applyTheme(); }catch(e){}
-    return {ok:true, version:version};
-  }catch(e){
-    console.error('cloudBackupPullVersion failed:', e);
-    return {ok:false, reason:'pull-failed', error:String(e&&e.message||e)};
-  }finally{
-    try{ if(FB.user) startListeners(); }catch(e){}
+    live=await cloudBackupReadManifest(uid);
+    const snap=await FB.db.collection('users').doc(uid).collection('backup').doc('historyIndex').collection('versions').doc(String(version)).get();
+    if(!snap.exists)return {ok:false,reason:'version-not-found'};
+    manifest=Object.assign({},snap.data(),{version});
+  }catch(e){return {ok:false,reason:'read-manifest-failed'};}
+  _ensureSyncQueues();
+  let ackVersion=live&&typeof live.version==='number'?live.version:version;
+  const cb=DB.meta.cloudBackup;
+  if(cb.pendingChanges.length||(typeof cb.lastPushedSaveSeq==='number'&&DB.meta._saveSeq>cb.lastPushedSaveSeq)){
+    const protection=await cloudBackupPush();
+    if(!protection||!protection.ok)return {ok:false,reason:'protective-backup-failed'};
+    if(typeof protection.version!=='number')return {ok:false,reason:'protective-version-unknown'};
+    ackVersion=protection.version;
   }
+  return _csApplyRestore(uid,manifest,ackVersion);
 }
 
 // v[TEST BUILD] List available versions for the Settings version-picker,
@@ -3673,6 +3747,7 @@ function downloadJSONBackup(dataObj,filenamePrefix){
 // means every caller, known or not, advances the same counter before
 // its write lands, with no per-call-site opt-in required.
 function persistDB(skipCloudBackupSchedule){
+  try{if(!skipCloudBackupSchedule&&FB.ready&&FB.user)detectAndQueueChangedItems();}catch(e){}
   bumpSaveStamp();
   if(idbReady && _idbHandle){
     idbSet(IDB_BLOB_KEY,DB).then(()=>clearSaveError()).catch(e=>{
@@ -3720,17 +3795,30 @@ async function idbMigrateAndLoad(){
   try{
     const existing=await idbGet(IDB_BLOB_KEY);
     if(existing && existing.entities){
-      // v[TEST BUILD BUGFIX 5] Prefer the monotonic _saveSeq counter over
-      // the wall-clock _savedAt string — a device clock tying or moving
-      // backward made this comparison pick the wrong store (see
-      // bumpSaveStamp()'s comment). Falls back to the old timestamp-only
-      // behavior only for data saved before _saveSeq existed on either
-      // side, so nothing already-saved breaks.
+      // v[TEST BUILD BUGFIX 5, re-applied after Codex review found it had
+      // regressed to two-state in this file] Prefer the monotonic
+      // _saveSeq counter over the wall-clock _savedAt string — a device
+      // clock tying or moving backward made this comparison pick the
+      // wrong store (see bumpSaveStamp()'s comment). Four cases, in
+      // order: (1) both sides have _saveSeq → compare counters; (2) only
+      // IndexedDB has one → IndexedDB wins outright (it went through a
+      // real save under the new code; the other side predates _saveSeq
+      // entirely, and its clock is not a trustworthy tiebreaker against a
+      // side that HAS a counter — this is also what protects against
+      // "one of the two storage locations failed to write" leaving that
+      // side seq-less); (3) only the in-memory/current copy has one →
+      // current wins outright, same reasoning, mirrored; (4) neither side
+      // has one → fall back to the old timestamp-only comparison
+      // (legacy, pre-_saveSeq data only).
       const idbSeq=(existing.meta&&typeof existing.meta._saveSeq==='number')?existing.meta._saveSeq:null;
       const curSeq=(DB.meta&&typeof DB.meta._saveSeq==='number')?DB.meta._saveSeq:null;
       let idbWins;
       if(idbSeq!==null && curSeq!==null){
         idbWins=idbSeq>=curSeq;
+      }else if(idbSeq!==null){
+        idbWins=true;
+      }else if(curSeq!==null){
+        idbWins=false;
       }else{
         const idbTime=(existing.meta&&existing.meta._savedAt)||'';
         const curTime=(DB.meta&&DB.meta._savedAt)||'';
@@ -26480,6 +26568,7 @@ try{
   }catch(e){console.warn('Messaging unsupported:',e);}
   FB.ready=true;
 }catch(e){console.warn('Firebase init failed:',e);}
+try{ if(typeof installReconnectRetry==='function') installReconnectRetry(); }catch(e){}
 
 /* ── Workspace ID per user ── */
 function wsId(uid){return 'user_'+uid;}
@@ -26662,10 +26751,37 @@ function startListeners(){
 
   const sync=(col,entity)=>db.collection('workspaces').doc(ws).collection(col)
     .onSnapshot(snap=>{
+      _ensureSyncQueues();
       snap.docChanges().forEach(ch=>{
+        // Fix (Codex review round 1, regression 1): a pending unsent local
+        // edit for this exact item must survive incoming snapshots — an
+        // incoming listener update is exactly the kind of "silent
+        // overwrite" this whole feature exists to prevent. Skip applying
+        // the snapshot to this item entirely while it's pending; once
+        // _syncOneItem resolves it (success or conflict), it leaves
+        // pendingChanges and future snapshots apply normally again.
+        const isPending = DB.meta.cloudBackup.pendingChanges.some(e=>e.entityType===entity && e.id===ch.doc.id);
+        const hasConflict=DB.meta.cloudBackup.conflicts.some(c=>c.entityType===entity&&c.id===ch.doc.id);
+        if(isPending||hasConflict) return;
+        if(ch.type==='removed'){ delete DB.entities[entity][ch.doc.id]; return; }
         const d=ch.doc.data();
-        if(ch.type==='removed')delete DB.entities[entity][ch.doc.id];
-        else DB.entities[entity][ch.doc.id]=d;
+        // Fix (Codex review round 2, finding 1): receiving a snapshot IS a
+        // confirmed read of the current server state — it must set the
+        // same baseline fields a successful WRITE sets, or a device that
+        // has only ever received (never yet pushed) this item queues its
+        // very first ordinary edit with baseV=null, which the migration-
+        // boundary check then correctly-but-wrongly treats as an unknown
+        // baseline and reports as a conflict. _lastSyncedV/
+        // _lastKnownServerUpdatedAt are LOCAL-ONLY bookkeeping — stripped
+        // before upload (see _syncOneItem) — so copying the whole `d`
+        // first, then setting them, can never leak a stale value from
+        // another device's copy of this same field.
+        DB.entities[entity][ch.doc.id]=Object.assign({}, d, {
+          _lastSyncedV: (typeof d._v==='number')?d._v:null,
+          _lastKnownServerUpdatedAt: d.updatedAt, _syncBase:_csCopy(d)
+        });
+        if(!DB.meta.cloudBackup._lastSeenContent)DB.meta.cloudBackup._lastSeenContent={};
+        DB.meta.cloudBackup._lastSeenContent[entity+'/'+ch.doc.id]=_csFingerprint(d);
       });
       persistDB();
       render();
@@ -26675,6 +26791,9 @@ function startListeners(){
   const u2=sync('lists','lists');
   const u3=sync('appts','appts');
   _syncUnsubs=[u1,u2,u3];
+  setTimeout(()=>{
+    if(FB.auth&&FB.auth.currentUser&&DB.meta.cloudBackup&&DB.meta.cloudBackup.pendingChanges&&DB.meta.cloudBackup.pendingChanges.length) syncPushSafe().catch(()=>{});
+  },0);
   try{ if(typeof FamilyBackend!=='undefined'){ FamilyBackend.start(); if(FamilyBackend.driving&&FamilyBackend.driving.recoverOnStart)FamilyBackend.driving.recoverOnStart(); } }catch(e){}
 }
 
@@ -26684,18 +26803,372 @@ function stopListeners(){
   try{ if(typeof FamilyBackend!=='undefined')FamilyBackend.stop(); }catch(e){}
 }
 
+/* v[next] CONFLICT-SAFE LIVE SYNC (design v3, this session) — replaces
+   the old blind syncPush. See concurrency-safety-design-proposal.md. */
+// ═══════════════════════════════════════════════════════════════════════
+// CONFLICT-SAFE LIVE SYNC (replaces the old blind syncPush /
+// _cloudBackupReconcileLiveSync). One account, many devices.
+//
+// Core rule: nothing here ever silently decides a winner. A detected
+// conflict is queued for the user; nothing is overwritten or deleted
+// automatically because it looks "older."
+// ═══════════════════════════════════════════════════════════════════════
+
+const LIVE_SYNC_TYPES = ['tasks','lists','appts'];
+
+function _csCopy(value){ return value==null?value:JSON.parse(JSON.stringify(value)); }
+
+function _csPayload(item){
+  const data=_csCopy(item)||{};
+  for(const key of ['_v','_lastOpId','_lastSyncedV','_lastKnownServerUpdatedAt','_pendingAttemptUpdatedAt','_pendingAttemptBaseV','_syncBase']) delete data[key];
+  return data;
+}
+
+function _csCanonical(value){
+  if(value===null || typeof value!=='object') return JSON.stringify(value);
+  if(Array.isArray(value)) return '['+value.map(_csCanonical).join(',')+']';
+  return '{'+Object.keys(value).sort().map(k=>JSON.stringify(k)+':'+_csCanonical(value[k])).join(',')+'}';
+}
+
+function _csFingerprint(item){ return item==null?'null':_csCanonical(_csPayload(item)); }
+
+function _csId(){
+  if(typeof crypto!=='undefined' && typeof crypto.randomUUID==='function') return crypto.randomUUID();
+  return Date.now().toString(36)+'-'+Math.random().toString(36).slice(2)+'-'+Math.random().toString(36).slice(2);
+}
+
+function _csAdopt(data){
+  if(!data) return null;
+  return Object.assign({},_csCopy(data),{_lastSyncedV:typeof data._v==='number'?data._v:null,_lastKnownServerUpdatedAt:data.updatedAt,_syncBase:_csCopy(data)});
+}
+
+async function _csPersist(){
+  try{ return (await _cloudBackupPersistLocalAwaited())===true; }
+  catch(e){ return false; }
+}
+
+function _csBaseMatches(operation,exists,data){
+  const v=exists&&typeof data._v==='number'?data._v:null;
+  if(operation.baseV!==null) return exists && v===operation.baseV;
+  if(!exists) return !operation.baseSnapshot;
+  // A legacy document requires its observed content, not just its timestamp.
+  return v===null && operation.baseSnapshot!=null && _csCanonical(data)===_csCanonical(operation.baseSnapshot);
+}
+
+function _csOperation(payload,baseV,baseSnapshot,ownerUid){
+  return {opId:_csId(),ownerUid,payload:_csPayload(payload),baseV:typeof baseV==='number'?baseV:null,baseSnapshot:_csCopy(baseSnapshot)||null};
+}
+
+async function _csCommit(ref,operation){
+  if(cloudBackupUid()!==operation.ownerUid) throw Object.assign(new Error('account-changed'),{code:'account-changed'});
+  const db=FB.db;
+  try{return await db.runTransaction(async tx=>{
+    if(cloudBackupUid()!==operation.ownerUid) throw Object.assign(new Error('account-changed'),{code:'account-changed'});
+    const snap=await tx.get(ref), data=snap.exists?snap.data():null;
+    if(data && data._lastOpId===operation.opId && _csFingerprint(data)===_csFingerprint(operation.payload)){
+      return {writtenV:data._v,serverItem:data,recoveredLateCommit:true};
+    }
+    if(!_csBaseMatches(operation,snap.exists,data)) throw Object.assign(new Error('version-conflict'),{code:'version-conflict',serverSnapshot:data});
+    const writtenV=(data&&typeof data._v==='number'?data._v:0)+1;
+    const serverItem=Object.assign({},operation.payload,{_v:writtenV,_lastOpId:operation.opId});
+    tx.set(ref,serverItem);
+    return {writtenV,serverItem,recoveredLateCommit:false};
+  });}catch(error){
+    // Rules may reject the stale write before the SDK retries the transaction.
+    // Re-read only to classify the conflict; never change this operation's base.
+    if(error.code==='permission-denied' || error.code==='firestore/permission-denied'){
+      let current;
+      try{current=await ref.get({source:'server'});}catch(readError){throw error;}
+      const data=current.exists?current.data():null;
+      if(!_csBaseMatches(operation,current.exists,data)) throw Object.assign(new Error('version-conflict'),{code:'version-conflict',serverSnapshot:data});
+    }
+    throw error;
+  }
+}
+
+async function _csTimedCommit(ref,operation){
+  if(!FB._syncTransactions) FB._syncTransactions=new Map();
+  const pending=FB._syncTransactions, key=operation.ownerUid+'/'+operation.opId;
+  let work=pending.get(key);
+  if(!work){
+    work=_csCommit(ref,operation); pending.set(key,work);
+    work.then(()=>{
+      pending.delete(key);
+      setTimeout(()=>{
+        if(FB.auth&&FB.auth.currentUser&&DB.meta.cloudBackup.pendingChanges.length) syncPushSafe().catch(()=>{});
+      },0);
+    },()=>pending.delete(key));
+  }
+  let timer;
+  try{
+    return await Promise.race([work,new Promise((_,reject)=>{timer=setTimeout(()=>reject(Object.assign(new Error('sync-timeout'),{code:'sync-timeout'})),8000);})]);
+  }finally{clearTimeout(timer);}
+}
+
+async function _csApplyRestore(uid,manifest,ackVersion){
+  if(FB._syncInFlight || FB._resolutionInFlight || FB._restoreInFlight || (FB._syncTransactions&&FB._syncTransactions.size)) return {ok:false,reason:'operation-in-progress'};
+  FB._restoreInFlight=true;
+  const before=_csCopy(DB.entities);
+  try{stopListeners();}catch(e){}
+  try{
+    const {restoredEntities,restoredMeta}=await _cloudBackupFetchVersionEntities(uid,manifest.version,manifest.entityCounts);
+    if(cloudBackupUid()!==uid) return {ok:false,reason:'account-changed'};
+    const result=await _cloudBackupReconcileLiveSyncSafe(restoredEntities);
+    if(cloudBackupUid()!==uid) return {ok:false,reason:'account-changed'};
+    const current=DB.entities, merged=_csCopy(current);
+    for(const [type,items] of Object.entries(restoredEntities||{})){
+      if(LIVE_SYNC_TYPES.includes(type)){
+        if(!merged[type]) merged[type]={};
+        for(const [id,accepted] of Object.entries((result.accepted||{})[type]||{})){
+          // Preserve edits made while fetching or reconciling, including equal-clock edits.
+          if(_csFingerprint((current[type]||{})[id])===_csFingerprint((before[type]||{})[id])) merged[type][id]=accepted;
+        }
+      }else{
+        merged[type]=_csCopy(items);
+        for(const id of new Set([...Object.keys(current[type]||{}),...Object.keys(before[type]||{})])){
+          if(_csCanonical((current[type]||{})[id])!==_csCanonical((before[type]||{})[id])){
+            if(id in (current[type]||{})) merged[type][id]=_csCopy(current[type][id]);else delete merged[type][id];
+          }
+        }
+      }
+    }
+    DB.entities=merged;
+    for(const k of CLOUD_BACKUP_META_FIELDS) if(k in (restoredMeta||{})) DB.meta[k]=restoredMeta[k];
+    Object.assign(DB.meta.cloudBackup,{cloudBackupLastSyncedVersion:ackVersion,lastRestoreAt:new Date().toISOString(),lastRestoredVersion:manifest.version});
+    if(!await _csPersist()) return {ok:false,reason:'local-save-failed',applied:result.applied,conflicted:result.conflicted};
+    try{if(typeof applyTheme==='function')applyTheme();}catch(e){}
+    return {ok:result.ok,version:manifest.version,applied:result.applied,conflicted:result.conflicted};
+  }catch(e){return {ok:false,reason:'pull-failed',error:e.message};}
+  finally{
+    FB._restoreInFlight=false;
+    try{if(FB.user&&cloudBackupUid()===uid)startListeners();}catch(e){}
+  }
+}
+
+// Durable queues live under DB.meta.cloudBackup — already outside
+// CLOUD_BACKUP_META_FIELDS (the whitelist Restore applies from a backup's
+// meta), so Restore never touches them; they persist via the normal
+// persistDB path, so app close/reopen never touches them either.
+function _ensureSyncQueues(){
+  if(!DB.meta.cloudBackup) DB.meta.cloudBackup={};
+  const cb=DB.meta.cloudBackup;
+  if(!Array.isArray(cb.pendingChanges)) cb.pendingChanges=[];
+  if(!Array.isArray(cb.conflicts)) cb.conflicts=[];
+  const owner=cloudBackupUid();
+  for(const entry of cb.pendingChanges) if(!entry.ownerUid) entry.ownerUid=owner;
+  for(const conflict of cb.conflicts){if(!conflict.conflictId) conflict.conflictId=_csId();if(!conflict.ownerUid) conflict.ownerUid=owner;}
+}
+
+// Queues an item for sync, capturing the base version THIS edit was made
+// against. If the item is already queued (an earlier local edit hasn't
+// synced yet), the ORIGINAL base is kept — a second local edit made with
+// no new information from the server must still be checked against what
+// the server was BEFORE either edit, not against our own unconfirmed
+// first edit.
+function queueSyncItem(entityType,id,baseV){
+  _ensureSyncQueues();
+  const item=DB.entities[entityType]&&DB.entities[entityType][id];
+  if(!item) return;
+  const ownerUid=cloudBackupUid(), q=DB.meta.cloudBackup.pendingChanges;
+  let entry=q.find(e=>e.entityType===entityType&&e.id===id&&e.ownerUid===ownerUid);
+  if(!entry){entry={entityType,id,ownerUid,baseV:typeof baseV==='number'?baseV:null,baseSnapshot:_csCopy(item._syncBase)||null,payload:_csPayload(item),generation:1};q.push(entry);}
+  else if(!entry.payload || _csFingerprint(entry.payload)!==_csFingerprint(item)){entry.payload=_csPayload(item);entry.generation=(entry.generation||0)+1;}
+  return entry;
+}
+
+// Called generically after ANY local save (same call site as the old
+// blind syncPush — saveDB() still just calls one function, unchanged).
+// Scans for items whose updatedAt moved since the last time THIS
+// function looked, and queues only those — this is what avoids touching
+// every individual task/list/appt edit call-site throughout the app
+// (there are many) while still capturing an accurate per-item base
+// version at the moment each change is first noticed.
+function detectAndQueueChangedItems(){
+  _ensureSyncQueues();
+  const cb=DB.meta.cloudBackup;
+  if(!cb._lastSeenContent) cb._lastSeenContent={};
+  for(const type of LIVE_SYNC_TYPES) for(const [id,item] of Object.entries(DB.entities[type]||{})){
+    const key=type+'/'+id, fingerprint=_csFingerprint(item);
+    if(cb._lastSeenContent[key]!==fingerprint){cb._lastSeenContent[key]=fingerprint;scheduleSafeSync(type,id);}
+  }
+}
+
+// Called at the moment of a local edit (before persistDB), not later —
+// this is what makes the base version meaningful: it reflects what this
+// device last confirmed from the server at EDIT time.
+function scheduleSafeSync(entityType,id){
+  const item=DB.entities[entityType]&&DB.entities[entityType][id];
+  if(item) queueSyncItem(entityType,id,typeof item._lastSyncedV==='number'?item._lastSyncedV:null);
+}
+
+// Attempts to sync ONE queued item via a real Firestore transaction, so
+// the version check and the write happen against a single consistent
+// server read. If Firestore retries this transaction body (because the
+// document changed between its internal read and commit), the retry
+// re-reads the document — but always compares against the SAME fixed
+// `baseV` passed into this call, never against whatever the retry just
+// read. A mismatch throws a real conflict; it is never silently adapted
+// into "well, write with server_v + 1 anyway."
+async function _syncOneItem(entityType,id,baseV,ws,uidOfCaller){
+  _ensureSyncQueues();
+  const owner=uidOfCaller||cloudBackupUid();
+  if(owner!==cloudBackupUid()) return {ok:false,reason:'account-changed'};
+  const entry=queueSyncItem(entityType,id,baseV);
+  if(!entry) return {ok:true,skipped:'no-local-item'};
+  if(!entry.attempt) entry.attempt=_csOperation(entry.payload,entry.baseV,entry.baseSnapshot,owner);
+  const operation=entry.attempt;
+  // Both the payload and operation identity must survive closing the app.
+  if(!await _csPersist()) return {ok:false,reason:'local-save-failed'};
+  const ref=FB.db.collection('workspaces').doc(ws).collection(entityType).doc(id);
+  try{
+    const result=await _csTimedCommit(ref,operation);
+    if(owner!==cloudBackupUid()) return {ok:false,reason:'account-changed'};
+    const item=DB.entities[entityType]&&DB.entities[entityType][id];
+    if(item){item._lastSyncedV=result.writtenV;item._lastKnownServerUpdatedAt=operation.payload.updatedAt;item._v=result.writtenV;item._syncBase=_csCopy(result.serverItem);}
+    return Object.assign({ok:true,payload:operation.payload,opId:operation.opId},result);
+  }catch(e){
+    if(e.code==='version-conflict'){
+      if(!DB.meta.cloudBackup.conflicts.some(c=>c.operation&&c.operation.opId===operation.opId)){
+        DB.meta.cloudBackup.conflicts.push({conflictId:_csId(),ownerUid:owner,entityType,id,source:'sync',operation:_csCopy(operation),localItem:_csCopy((DB.entities[entityType]||{})[id]||entry.payload),serverItem:_csCopy(e.serverSnapshot),detectedAt:new Date().toISOString()});
+      }
+      return {ok:false,reason:'conflict'};
+    }
+    return {ok:false,reason:'retry-later',error:e.code||e.message};
+  }
+}
+
+// Drains the pending queue. Items that sync successfully or resolve to a
+// detected conflict are removed from pendingChanges (conflicts move to
+// the conflicts queue instead — never silently dropped). Items that fail
+// for any other reason (offline, network error) STAY queued for the next
+// attempt — this is what survives an offline period: the queue itself,
+// not reliance on Firestore's own offline replay (which this app does not
+// currently enable).
+// ── Conflict resolution (this round: the missing product flow Codex
+// flagged in finding 7 — conflicts were being recorded but nothing let a
+// user see or resolve them). choice is 'local' | 'server' | 'backup'.
+// Never silently overwrites: 'local'/'backup' re-validate against the
+// server AT COMMIT TIME (one transaction, not a separate check-then-
+// write), and if the server moved again since the conflict was shown,
+// the attempt is refused and the conflict record is refreshed with the
+// new live state — the user decides again, explicitly, next time.
+async function resolveConflict(conflictIndex,choice){
+  _ensureSyncQueues();
+  const cb=DB.meta.cloudBackup, conflict=typeof conflictIndex==='string'?cb.conflicts.find(c=>c.conflictId===conflictIndex):cb.conflicts[conflictIndex];
+  if(!conflict) return {ok:false,reason:'not-found'};
+  if(!['local','server','backup'].includes(choice)) return {ok:false,reason:'invalid-choice'};
+  const owner=cloudBackupUid();
+  if(!owner || conflict.ownerUid!==owner) return {ok:false,reason:'not-signed-in'};
+  if(FB._syncInFlight || FB._restoreInFlight || FB._resolutionInFlight || (FB._syncTransactions&&FB._syncTransactions.size)) return {ok:false,reason:'operation-in-progress'};
+  FB._resolutionInFlight=true;
+  try{
+    const type=conflict.entityType,id=conflict.id;
+    if(!('resolutionLocalFingerprint' in conflict)) conflict.resolutionLocalFingerprint=_csFingerprint((DB.entities[type]||{})[id] ? (conflict.currentLocalItem||conflict.localItem) : null);
+    const localAtChoice=conflict.resolutionLocalFingerprint;
+    const ref=FB.db.collection('workspaces').doc(wsId(owner)).collection(type).doc(id);
+    let chosen;
+    if(choice==='server'){
+      const snap=await ref.get({source:'server'});chosen=snap.exists?snap.data():null;
+    }else{
+      const content=choice==='local'?(conflict.currentLocalItem||conflict.localItem):conflict.backupItem;
+      if(!content) return {ok:false,reason:'no-content-for-choice'};
+      const prev=conflict.resolutionAttempt;
+      if(prev && conflict.resolutionChoice!==choice && !conflict.resolutionCommitted) return {ok:false,reason:'previous-choice-pending'};
+      if(!prev || conflict.resolutionChoice!==choice){
+        conflict.resolutionAttempt=_csOperation(content,conflict.serverItem&&conflict.serverItem._v,conflict.serverItem,owner);
+        conflict.resolutionChoice=choice;
+      }
+      if(!await _csPersist()) return {ok:false,reason:'local-save-failed'};
+      try{
+        const result=await _csCommit(ref,conflict.resolutionAttempt);chosen=result.serverItem;
+      }catch(e){
+        if(e.code==='version-conflict'){
+          conflict.serverItem=_csCopy(e.serverSnapshot);conflict.driftedAt=new Date().toISOString();delete conflict.resolutionAttempt;delete conflict.resolutionChoice;
+          await _csPersist();return {ok:false,reason:'drifted-again',freshServerItem:e.serverSnapshot};
+        }
+        return {ok:false,reason:'write-failed',error:e.code||e.message};
+      }
+    }
+    if(owner!==cloudBackupUid()) return {ok:false,reason:'account-changed'};
+    // Journal the accepted outcome while retaining all conflict versions.
+    conflict.resolutionCommitted=true;conflict.resolvedServerItem=_csCopy(chosen);
+    if(!await _csPersist()) return {ok:false,reason:'local-save-failed',serverCommitted:choice!=='server'};
+    if(!DB.entities[type]) DB.entities[type]={};
+    const unchanged=_csFingerprint(DB.entities[type][id])===localAtChoice;
+    const oldQueue=cb.pendingChanges.filter(e=>e.entityType===type&&e.id===id&&e.ownerUid===owner);
+    if(unchanged){
+      if(chosen) DB.entities[type][id]=_csAdopt(chosen);else delete DB.entities[type][id];
+      cb.pendingChanges=cb.pendingChanges.filter(e=>!oldQueue.includes(e));
+    }else{
+      // A newer local edit remains pending against the version just accepted.
+      const item=DB.entities[type][id];
+      if(item){item._lastSyncedV=chosen&&typeof chosen._v==='number'?chosen._v:null;item._syncBase=_csCopy(chosen);}
+      cb.pendingChanges=cb.pendingChanges.filter(e=>!oldQueue.includes(e));
+      if(item) queueSyncItem(type,id,item._lastSyncedV);
+    }
+    const idx=cb.conflicts.indexOf(conflict);if(idx>=0) cb.conflicts.splice(idx,1);
+    if(!await _csPersist()){
+      if(!cb.conflicts.includes(conflict)) cb.conflicts.push(conflict);
+      return {ok:false,reason:'local-save-failed',serverCommitted:choice!=='server'};
+    }
+    return {ok:true,localEditPreserved:!unchanged};
+  }finally{FB._resolutionInFlight=false;}
+}
+
+
+async function syncPushSafe(){
+  _ensureSyncQueues();
+  if(FB._syncInFlight){FB._syncRerunNeeded=true;return {ok:true,deferred:true};}
+  if(FB._restoreInFlight || FB._resolutionInFlight) return {ok:false,reason:'operation-in-progress'};
+  FB._syncInFlight=true;
+  const owner=cloudBackupUid();
+  try{
+    if(!owner) return {ok:false,reason:'not-signed-in'};
+    const q=DB.meta.cloudBackup.pendingChanges;
+    let synced=0,conflicted=0,retryLater=0;
+    for(const entry of q.slice()){
+      if(entry.ownerUid!==owner) continue;
+      // Conflicted items stay local until an explicit resolution.
+      if(DB.meta.cloudBackup.conflicts.some(c=>c.ownerUid===owner&&c.entityType===entry.entityType&&c.id===entry.id)) continue;
+      const r=await _syncOneItem(entry.entityType,entry.id,entry.baseV,wsId(owner),owner);
+      if(owner!==cloudBackupUid()) return {ok:false,reason:'account-changed'};
+      if(r.ok){
+        synced++;
+        const item=(DB.entities[entry.entityType]||{})[entry.id];
+        if(item && _csFingerprint(item)!==_csFingerprint(r.payload)){
+          entry.baseV=r.writtenV;entry.baseSnapshot=_csCopy(r.serverItem);entry.payload=_csPayload(item);entry.attempt=null;entry.generation=(entry.generation||0)+1;
+        }else{const idx=q.indexOf(entry);if(idx>=0)q.splice(idx,1);}
+      }else if(r.reason==='conflict'){conflicted++;const idx=q.indexOf(entry);if(idx>=0)q.splice(idx,1);}
+      else retryLater++;
+    }
+    if(!await _csPersist()) return {ok:false,reason:'local-save-failed',synced,conflicted,retryLater};
+    return {ok:true,synced,conflicted,retryLater};
+  }finally{
+    FB._syncInFlight=false;
+    if(FB._syncRerunNeeded){FB._syncRerunNeeded=false;syncPushSafe().catch(()=>{});}
+  }
+}
+
+// Re-attempt on reconnect — this is the piece that actually closes the
+// "offline device reconnecting" gap: without it, a device only retries
+// its queue on its NEXT local edit (today's `syncPush`-on-every-save
+// behavior), which could be a long, silent gap.
+// Same name/call-site contract as the old syncPush — saveDB() calls this
+// exactly as before, unchanged. Internally: detect what changed, queue
+// it, attempt to drain the queue via real per-item transactions.
 function syncPush(){
   if(!FB.ready||!FB.user)return;
-  if(!sessionCap('sync'))return;   // guest (future) = local-only, no Firestore writes
-  const ws=wsId(FB.user.uid);
-  const db=FB.db;
-  const batch=db.batch();
-  const col=(name)=>db.collection('workspaces').doc(ws).collection(name);
-  Object.values(DB.entities.tasks||{}).forEach(t=>batch.set(col('tasks').doc(t.id),t));
-  Object.values(DB.entities.lists||{}).forEach(l=>batch.set(col('lists').doc(l.id),l));
-  Object.values(DB.entities.appts||{}).forEach(a=>batch.set(col('appts').doc(a.id),a));
-  batch.commit().catch(()=>{});
+  if(!sessionCap('sync'))return;
+  detectAndQueueChangedItems();
+  syncPushSafe().catch(()=>{}); // fire-and-forget, matching the old call site's own contract; failures stay queued for retry
 }
+
+function installReconnectRetry(){
+  if(typeof window !== 'undefined' && window.addEventListener){
+    window.addEventListener('online', ()=>{ syncPushSafe().catch(()=>{}); });
+  }
+}
+
 
 /* ── Profile sync (name + photo/avatar) — separate doc, small payload ── */
 function pushProfile(){
@@ -27195,6 +27668,9 @@ function openSettingsSheet(){
         <div id="cb-test-history-list" style="margin-top:8px;display:none"></div>
       </div>
 
+      <div class="hub-sec-label" id="cb-conflicts-label" style="display:none"></div>
+      <div class="set-group" id="cb-conflicts-panel" style="display:none;padding:12px 16px"></div>
+
       <div style="padding:6px 14px 24px"><button class="set-signout" data-set="signout">${tr('signOut')}</button></div>
     </div>
     <input type="file" id="acct-file" accept="image/*" style="display:none">`;
@@ -27222,6 +27698,7 @@ function openSettingsSheet(){
       }catch(e){ extra='THREW — '+(e&&e.stack||e); toast('Backup threw, see status below'); }
       pushBtn.disabled=false; pushBtn.textContent='Backup now';
       refreshStatus(extra);
+      renderConflictsPanel();
     };
     if(pullBtn) pullBtn.onclick=async()=>{
       const ok=confirm('This will overwrite your CURRENT data (tasks, notes, everything) — on THIS device and in shared/synced storage — with the latest cloud backup. If another device is editing right now, its changes could be lost. This cannot be undone locally. Continue?');
@@ -27231,12 +27708,82 @@ function openSettingsSheet(){
       try{
         const r=await cloudBackupPull();
         if(r&&r.ok){ toast('Restore complete'); }
+        else if(r&&r.conflicted>0){ extra='PARTIAL — '+r.conflicted+' item(s) need your decision below.'; toast('Restore partially applied — see conflicts below'); }
         else { extra='FAILED — reason: '+JSON.stringify(r); toast('Restore failed, see status below'); }
       }catch(e){ extra='THREW — '+(e&&e.stack||e); toast('Restore threw, see status below'); }
       pullBtn.disabled=false; pullBtn.textContent='Restore now';
       refreshStatus(extra);
+      renderConflictsPanel();
       try{ render(); }catch(e){}
     };
+
+    // ── Conflict resolution panel ──
+    // Local/server/backup are shown side by side, in full, so nothing is
+    // ever a mystery choice. Buttons call resolveConflict(), which
+    // re-validates against the live server at commit time — a "drifted
+    // again" result re-renders this same conflict with the fresh live
+    // content instead of silently applying the stale choice.
+    function conflictSummary(item){
+      if(!item) return '<span style="color:var(--ink3)">Item does not exist</span>';
+      const data=_csPayload(item);
+      const labels={title:'Title',notes:'Notes',text:'Text',completedAt:'Completed',archivedAt:'In Trash',dueDate:'Due date',dueTime:'Due time',listId:'List',updatedAt:'Last edited'};
+      return '<dl style="margin:0;max-height:300px;overflow:auto;font-size:11px">'+Object.entries(data).filter(([key])=>key!=='id'&&key!=='createdAt').map(([key,value])=>{
+        const label=labels[key]||key.replace(/([a-z])([A-Z])/g,'$1 $2');
+        if(key==='listId'&&value&&DB.entities.lists&&DB.entities.lists[value])value=DB.entities.lists[value].title||DB.entities.lists[value].name||value;
+        const text=value==null?'None':typeof value==='boolean'?(value?'Yes':'No'):typeof value==='object'?JSON.stringify(value,null,2):String(value);
+        return '<dt style="font-weight:700;margin-top:6px">'+esc(label)+'</dt><dd style="margin:0;white-space:pre-wrap;overflow-wrap:anywhere">'+esc(text)+'</dd>';
+      }).join('')+'</dl>';
+    }
+    function renderConflictsPanel(){
+      _ensureSyncQueues();
+      const label=document.getElementById('cb-conflicts-label');
+      const panel=document.getElementById('cb-conflicts-panel');
+      if(!label||!panel) return;
+      const conflicts=DB.meta.cloudBackup.conflicts||[];
+      if(conflicts.length===0){ label.style.display='none'; panel.style.display='none'; panel.innerHTML=''; return; }
+      label.style.display=''; panel.style.display='';
+      label.textContent='Conflicts needing your decision ('+conflicts.length+')';
+      panel.innerHTML=conflicts.map((c,i)=>{
+        const hasBackup = c.source==='restore';
+        const localContent = hasBackup ? c.currentLocalItem : c.localItem;
+        const cols=[
+          ['Local copy', localContent],
+          ['Server snapshot', c.serverItem]
+        ];
+        if(hasBackup) cols.push(['Backup (being restored)', c.backupItem]);
+        const colsHtml=cols.map(([label,item])=>
+          '<div style="flex:1;min-width:0;border:1px solid var(--b1);border-radius:8px;padding:8px">'
+          +'<div style="font-size:9px;color:var(--ink3);text-transform:uppercase;margin-bottom:4px">'+esc(label)+'</div>'
+          +conflictSummary(item)+'</div>'
+        ).join('');
+        const driftedNote = c.driftedAt ? '<div style="color:#f43f5e;font-size:10px;margin:6px 0">⚠ Server changed again after you last looked — review before deciding.</div>' : '';
+        return '<div style="border:1px solid var(--b1);border-radius:10px;padding:10px;margin-bottom:10px">'
+          +'<div style="font-size:10px;color:var(--ink3);margin-bottom:6px">'+esc(c.entityType)+' / '+esc(c.id)+'</div>'
+          +driftedNote
+          +'<div style="display:flex;gap:6px;margin-bottom:8px">'+colsHtml+'</div>'
+          +'<div style="display:flex;gap:6px">'
+          +'<button class="btn btn-ghost" data-resolve="'+esc(c.conflictId)+'" data-choice="local" style="flex:1;font-size:11px">Keep local</button>'
+          +'<button class="btn btn-ghost" data-resolve="'+esc(c.conflictId)+'" data-choice="server" style="flex:1;font-size:11px">Keep server</button>'
+          +(hasBackup?'<button class="btn btn-ghost" data-resolve="'+esc(c.conflictId)+'" data-choice="backup" style="flex:1;font-size:11px">Keep backup</button>':'')
+          +'</div></div>';
+      }).join('');
+      panel.querySelectorAll('[data-resolve]').forEach(btn=>{
+        btn.onclick=async()=>{
+          const idx=btn.getAttribute('data-resolve');
+          const choice=btn.getAttribute('data-choice');
+          panel.querySelectorAll('button').forEach(b=>b.disabled=true);
+          try{
+            const r=await resolveConflict(idx, choice);
+            if(r.ok){ toast(r.localEditPreserved?'Choice saved; newer local edits kept for sync':'Conflict resolved'); }
+            else if(r.reason==='drifted-again'){ toast('Server changed again — review and decide once more'); }
+            else { toast('Could not resolve: '+(r.reason||'unknown error')); }
+          }catch(e){ toast('Resolve threw: '+(e&&e.message||e)); }
+          renderConflictsPanel();
+          try{ render(); }catch(e){}
+        };
+      });
+    }
+    renderConflictsPanel();
 
     const historyBtn=document.getElementById('cb-test-history');
     const historyListEl=document.getElementById('cb-test-history-list');
