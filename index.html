@@ -2211,7 +2211,7 @@ try{
     });
   });
 }catch(e){}
-const APP_VERSION='v593';
+const APP_VERSION='v594';
 const SCHEMA=1;
 const KEY='mbmlife_platform_v1';
 /* Global: true when running inside the MBM Life Android companion WebView
@@ -2829,6 +2829,8 @@ function cloudBackupBuildMetaPayload(meta){
 async function cloudBackupPush(){
   const uid=cloudBackupUid();
   if(!uid) return {ok:false, reason:'not-signed-in'};
+  if(!_dbOwnedByCurrentUser()) return {ok:false, reason:'ownership-unconfirmed'}; // ACCOUNT ISOLATION: never back up data of unverified ownership
+  const idTok=_identityToken();
   // Fix (Codex review round 2, finding 5, second half): capture the save
   // sequence NOW, at the moment this snapshot is taken — not at upload
   // completion. The push below can take a while (attachment uploads,
@@ -2910,6 +2912,7 @@ async function cloudBackupPush(){
     }
 
     for(const type of CLOUD_BACKUP_ENTITY_TYPES){
+      if(!_identityStillValid(idTok)) throw new Error('account-changed'); // never read another identity's DB into this uid's backup
       const rawMap=DB.entities[type]||{};
       const recordsCol=versionCol.doc(type).collection('records');
       let count=0;
@@ -2991,6 +2994,7 @@ async function cloudBackupPush(){
       entityCounts[type]=count;
     }
 
+    if(!_identityStillValid(idTok)) throw new Error('account-changed');
     const metaPayload=cloudBackupBuildMetaPayload(DB.meta);
     cloudBackupAssertNoSecretMaterial(metaPayload);
     await queueWrite(versionCol.doc('_meta'), metaPayload);
@@ -3035,6 +3039,7 @@ async function cloudBackupPush(){
       });
     });
 
+    if(!_identityStillValid(idTok)) return {ok:false, reason:'account-changed', version:nextVersion};
     DB.meta.cloudBackup=Object.assign({}, DB.meta.cloudBackup, {cloudBackupLastSyncedVersion:nextVersion, lastPushAt:new Date().toISOString(), lastPushError:null, lastPushedSaveSeq:_saveSeqAtSnapshotTime});
     // v[next] FIX (code review round 2, 2026-09-08): a successful push
     // updated DB.meta.cloudBackup only in memory — with no persistDB()
@@ -3049,6 +3054,7 @@ async function cloudBackupPush(){
     return {ok:true, version:nextVersion};
   }catch(e){
     console.error('cloudBackupPush failed:', e);
+    if(!_identityStillValid(idTok)) return {ok:false, reason:'account-changed'};
     DB.meta.cloudBackup=Object.assign({}, DB.meta.cloudBackup, {lastPushError:String(e&&e.message||e), lastPushErrorAt:new Date().toISOString()});
     try{persistDB(true);}catch(e2){} // true: same reason as the success path above
     await cloudBackupWriteProgress(uid,'failed',{finishedAt:firebase.firestore.FieldValue.serverTimestamp(), lastError:String(e&&e.message||e)});
@@ -3313,6 +3319,7 @@ async function guardedRestore(doRestoreFn){
 // silently discarded. This does not fix the app's general timestamp-
 // comparison fragility elsewhere; it only removes it as a factor here.
 async function _cloudBackupPersistLocalAwaited(){
+  if(!_dbOwnedByCurrentUser()) return false; // ACCOUNT ISOLATION
   bumpSaveStamp();
   const savedSnapshot=JSON.parse(JSON.stringify(DB));
   if(idbReady && _idbHandle){
@@ -3333,10 +3340,14 @@ async function _cloudBackupPersistLocalAwaited(){
   }
 }
 
-async function cloudBackupPull(){
+async function cloudBackupPull(expectedUid){
   const uid=cloudBackupUid();if(!uid)return {ok:false,reason:'not-signed-in'};
+  if(expectedUid && expectedUid!==uid) return {ok:false,reason:'account-changed'}; // ACCOUNT ISOLATION
+  if(!_dbOwnedByCurrentUser())return {ok:false,reason:'ownership-unconfirmed'}; // ACCOUNT ISOLATION
+  const idTok=_identityToken();
   let manifest;
   try{manifest=await cloudBackupReadManifest(uid);}catch(e){return {ok:false,reason:'read-manifest-failed'};}
+  if(!_identityStillValid(idTok))return {ok:false,reason:'account-changed'};
   const gate=cloudBackupCanRestore(manifest);if(!gate.allowed)return {ok:false,reason:gate.reason};
   _ensureSyncQueues();
   if(FB._syncInFlight||FB._resolutionInFlight||FB._restoreInFlight||(FB._syncTransactions&&FB._syncTransactions.size))return {ok:false,reason:'operation-in-progress'};
@@ -3363,6 +3374,8 @@ async function cloudBackupPull(){
 // known cloud state, which it has now explicitly acknowledged.
 async function cloudBackupPullVersion(version){
   const uid=cloudBackupUid();if(!uid)return {ok:false,reason:'not-signed-in'};
+  if(!_dbOwnedByCurrentUser())return {ok:false,reason:'ownership-unconfirmed'}; // ACCOUNT ISOLATION
+  const idTok=_identityToken();
   if(FB._syncInFlight||FB._resolutionInFlight||FB._restoreInFlight||(FB._syncTransactions&&FB._syncTransactions.size))return {ok:false,reason:'operation-in-progress'};
   let live,manifest;
   try{
@@ -3371,6 +3384,7 @@ async function cloudBackupPullVersion(version){
     if(!snap.exists)return {ok:false,reason:'version-not-found'};
     manifest=Object.assign({},snap.data(),{version});
   }catch(e){return {ok:false,reason:'read-manifest-failed'};}
+  if(!_identityStillValid(idTok))return {ok:false,reason:'account-changed'};
   _ensureSyncQueues();
   let ackVersion=live&&typeof live.version==='number'?live.version:version;
   const cb=DB.meta.cloudBackup;
@@ -3415,22 +3429,8 @@ async function cloudBackupListVersionHistory(afterVersion){
   }
 }
 
-async function cloudBackupMaybeAutoRestoreOnBoot(){
-  try{
-    if(!cloudBackupIsLocalEmpty(DB)) return {ok:true, reason:'local-not-empty'};
-    const uid=cloudBackupUid();
-    if(!uid) return {ok:false, reason:'not-signed-in'};
-    const manifest=await cloudBackupReadManifest(uid);
-    const gate=cloudBackupCanRestore(manifest);
-    if(!gate.allowed) return {ok:false, reason:gate.reason};
-    return await cloudBackupPull();
-  }catch(e){
-    console.error('cloudBackupMaybeAutoRestoreOnBoot failed (non-fatal, app continues with local/empty state):', e);
-    return {ok:false, reason:'auto-restore-failed', error:e};
-  }
-}
 
-// v[TEST BUILD] Same eligibility check as cloudBackupMaybeAutoRestoreOnBoot,
+// v[TEST BUILD] Same eligibility check as a plain auto-restore would use,
 // but instead of silently restoring, ASKS the user first — matching the
 // WhatsApp-style "a backup was found, restore it?" pattern. If the user
 // declines, we must not leave this device permanently unable to push new
@@ -3445,21 +3445,26 @@ async function cloudBackupMaybeAutoRestoreOnBoot(){
 // tracked separately, is what would let a user recover it later).
 async function cloudBackupPromptOnBoot(){
   try{
+    if(!_dbOwnedByCurrentUser()) return {ok:false, reason:'ownership-unconfirmed'}; // ACCOUNT ISOLATION
+    const idTok=_identityToken();
     if(!cloudBackupIsLocalEmpty(DB)) return {ok:true, reason:'local-not-empty'};
     const uid=cloudBackupUid();
     if(!uid) return {ok:false, reason:'not-signed-in'};
     const manifest=await cloudBackupReadManifest(uid);
+    if(!_identityStillValid(idTok) || cloudBackupUid()!==uid) return {ok:false, reason:'account-changed'}; // ACCOUNT ISOLATION
     const gate=cloudBackupCanRestore(manifest);
     if(!gate.allowed) return {ok:false, reason:gate.reason};
 
     const choice=await cloudBackupShowRestoreDialog(manifest);
+    if(!_identityStillValid(idTok) || cloudBackupUid()!==uid) return {ok:false, reason:'account-changed'}; // ACCOUNT ISOLATION: the dialog can sit open a long time
     if(choice==='restore'){
-      return await cloudBackupPull();
+      return await cloudBackupPull(uid);
     }else{
       // Acknowledge the cloud version without importing it, so future
       // pushes from this device are allowed (see cloudBackupCanPush) and
       // start a NEW version chain — the declined backup's own documents
       // are never touched or deleted by this.
+      if(!_identityStillValid(idTok) || cloudBackupUid()!==uid) return {ok:false, reason:'account-changed'}; // ACCOUNT ISOLATION
       DB.meta.cloudBackup=Object.assign({}, DB.meta.cloudBackup, {cloudBackupLastSyncedVersion:manifest.version});
       try{ persistDB(true); }catch(e){}
       return {ok:true, reason:'user-declined-restore', acknowledgedVersion:manifest.version};
@@ -3554,64 +3559,7 @@ function loadDB(){
     if(!raw)return seedDB(blankDB());
     const d=JSON.parse(raw);
     if(!d||!d.entities)return seedDB(blankDB());
-    // ensure all entity collections exist
-    ['tasks','lists','people','events','expenses','notes','places','shopLists','shopItems','noteItems','noteFolders','payments','payFolders','vaultItems','vaultFolders','documents','docFolders','trips','tripReminderDone','docReminderDone','_docPayLinks','familyMembers','familyPlaces','familyPets','familyKeys','familyInvites','familyTimeline','famLocations','famRoutes','famConsent']
-      .forEach(e=>{if(!d.entities[e])d.entities[e]={};});
-    // ── Travel data repair (safe, no data loss) ──
-    try{
-      Object.values(d.entities.trips||{}).forEach(t=>{
-        if(!t||typeof t!=='object')return;
-        // Repair swapped/invalid dates: if end < start, swap them (preserves both values).
-        if(t.startDate&&t.endDate&&t.endDate<t.startDate){ const tmp=t.startDate; t.startDate=t.endDate; t.endDate=tmp; }
-        // Backfill a meaningful title for legacy "New trip"/empty placeholders using known fields.
-        if(!t.title||/^new trip$/i.test(t.title.trim())){
-          const place=t.city||t.destination||t.country||'';
-          if(place){ let nights=0; if(t.startDate&&t.endDate){ const s=new Date(t.startDate+'T00:00:00'),e=new Date(t.endDate+'T00:00:00'); if(!isNaN(s)&&!isNaN(e))nights=Math.max(0,Math.round((e-s)/86400000)); }
-            t.title = nights>=10?`${place} Holiday`:nights>=6?`A Week in ${place}`:nights>=3?`${place} Getaway`:nights>=1?`${place} Weekend`:`Trip to ${place}`;
-          }
-        }
-        // Ensure new segment fields exist on old segments (non-destructive).
-        (t.segments||[]).forEach(sg=>{ ['vehicleNo','depPoint','arrPoint'].forEach(k=>{ if(sg[k]===undefined)sg[k]=''; }); if(sg.distanceKm===undefined)sg.distanceKm=0; if(sg.durationH===undefined)sg.durationH=0; });
-      });
-    }catch(_){}
-    if(!d.meta)d.meta={};
-    if(!d.meta.viewSort)d.meta.viewSort={};
-    if(!d.meta.viewOrder)d.meta.viewOrder={};
-    if(d.meta.addOnTop===undefined)d.meta.addOnTop=true;
-    if(d.meta.starTop===undefined)d.meta.starTop=true;
-    if(d.meta.soundOn===undefined)d.meta.soundOn=true;
-    if(d.meta.confirmDel===undefined)d.meta.confirmDel=true;
-    if(d.meta.pushEnabled===undefined)d.meta.pushEnabled=false;
-    if(d.meta.notifPermGranted===undefined)d.meta.notifPermGranted=false;
-    if(d.meta.notifPrefs===undefined)d.meta.notifPrefs={taskReminders:true,dueToday:true,sharedActivity:true};
-    if(d.meta.accent===undefined)d.meta.accent=null;
-    if(d.meta.showDueMyDay===undefined)d.meta.showDueMyDay=true;
-    if(d.meta.recogniseDates===undefined)d.meta.recogniseDates=true;
-    if(d.meta.removeDates===undefined)d.meta.removeDates=false;
-    if(d.meta.weekStart===undefined)d.meta.weekStart='system';
-    if(d.meta.autoHideSmart===undefined)d.meta.autoHideSmart=false;
-    if(!d.meta.smartShow||typeof d.meta.smartShow!=='object')d.meta.smartShow={};
-    ['myday','important','planned','assigned','all'].forEach(k=>{if(d.meta.smartShow[k]===undefined)d.meta.smartShow[k]=true;});
-    if(!Array.isArray(d.meta.groups))d.meta.groups=[];
-    if(!Object.keys(d.entities.lists).length)seedDB(d);
-    // ── Activity layer state (history-only; never touches canonical data) ──
-    if(!d.meta.familyServer||typeof d.meta.familyServer!=='object')d.meta.familyServer={};
-    // ── Phase 1: legacy local invitations are NOT cloud invitations. Mark them
-    // legacy (non-destructive) so they never render/count as cloud invites. ──
-    try{ if(!d.meta._famInviteMigrated){ Object.values(d.entities.familyInvites||{}).forEach(inv=>{ if(inv&&!inv.server){ inv.legacy=true; } }); d.meta._famInviteMigrated=true; } }catch(_){}
-    // Phase 2 Stage 1: ensure location entities exist (additive, no data touched).
-    if(!d.entities.famLocations||typeof d.entities.famLocations!=='object')d.entities.famLocations={};
-    if(!d.entities.famRoutes||typeof d.entities.famRoutes!=='object')d.entities.famRoutes={};
-    if(!d.entities.famConsent||typeof d.entities.famConsent!=='object')d.entities.famConsent={};
-    if(!d.entities.famEvents||typeof d.entities.famEvents!=='object')d.entities.famEvents={};
-    if(!d.entities.famGeoState||typeof d.entities.famGeoState!=='object')d.entities.famGeoState={};
-    if(!d.entities.famNoShow||typeof d.entities.famNoShow!=='object')d.entities.famNoShow={};
-    if(!d.entities.activity)d.entities.activity={};
-    if(d.meta.activityRetentionDays===undefined)d.meta.activityRetentionDays=0; // 0 = Forever
-    if(!d.meta.activityHidden||typeof d.meta.activityHidden!=='object')d.meta.activityHidden={};
-    // Enforce retention on the STORED ephemeral log only (bounded storage).
-    try{ const days=d.meta.activityRetentionDays|0; if(days>0){ const cut=Date.now()-days*864e5; Object.values(d.entities.activity).forEach(e=>{ const t=Date.parse(e.at||''); if(!isNaN(t)&&t<cut)delete d.entities.activity[e.id]; }); } }catch(_){}
-    return d;
+    return _normalizeDB(d);
   }catch(e){return seedDB(blankDB());}
 }
 // v[TEST BUILD BUGFIX 5] REPRODUCED BUG (equal/backward clock cases):
@@ -3747,6 +3695,7 @@ function downloadJSONBackup(dataObj,filenamePrefix){
 // means every caller, known or not, advances the same counter before
 // its write lands, with no per-call-site opt-in required.
 function persistDB(skipCloudBackupSchedule){
+  if(!_dbOwnedByCurrentUser()) return; // ACCOUNT ISOLATION: never write data whose owner is unconfirmed
   try{if(!skipCloudBackupSchedule&&FB.ready&&FB.user)detectAndQueueChangedItems();}catch(e){}
   bumpSaveStamp();
   if(idbReady && _idbHandle){
@@ -3784,7 +3733,239 @@ function persistDB(skipCloudBackupSchedule){
 // persistDB() treats IndexedDB as primary. If IndexedDB already has newer
 // data than what loadDB() found (a device that's already migrated), that
 // newer copy wins and the UI re-renders with it.
+let _dbOwnerUid=null, _identityGen=0, _authEpoch=0;
+let _idbReadyPromise=null, _idbOpenTimedOut=false, _profileUnsub=null, _idbReadFailed=false;
+const IDB_IN_USE_LS_KEY='mbmlife_idb_in_use'; // set once IndexedDB has held this device's data
+const XACCT_Q_IDB_KEY='xacct_quarantine_v1', XACCT_Q_LS_KEY='mbmlife_xacct_quarantine_v1';
+let _xacctChain=Promise.resolve();
+
+function _dbOwnedByCurrentUser(){
+  const u=(typeof cloudBackupUid==='function')?cloudBackupUid():null;
+  return !!u && _dbOwnerUid===u && !!DB && !!DB.meta && DB.meta.userId===u;
+}
+
+function _setDbOwner(uid){ if(_dbOwnerUid!==uid){ _dbOwnerUid=uid; _identityGen++; } }
+
+function _identityToken(){ return {gen:_identityGen, uid:_dbOwnerUid}; }
+
+function _identityStillValid(t){ return !!t && !!t.uid && t.gen===_identityGen && t.uid===_dbOwnerUid && _dbOwnedByCurrentUser(); }
+
+function _xacctHasUserData(d){
+  if(!d || !d.entities) return false;
+  for(const [type,map] of Object.entries(d.entities)){
+    if(!map || typeof map!=='object') continue;
+    const keys=Object.keys(map);
+    if(type==='lists'){ if(keys.some(k=>k!=='inbox')) return true; continue; }
+    if(keys.length) return true;
+  }
+  const cb=d.meta&&d.meta.cloudBackup;
+  if(!cb) return false;
+  if(cb.conflicts&&cb.conflicts.length) return true;
+  // a queued first sync of the default inbox alone is seed data, not user data
+  return !!(cb.pendingChanges && cb.pendingChanges.some(e=>!(e&&e.entityType==='lists'&&e.id==='inbox')));
+}
+
+async function _xacctReadQuarantine(){
+  let fromIdb=[], fromLs=[], idbOk=true, lsOk=true;
+  if(idbReady && _idbHandle){
+    try{ const v=await idbGet(XACCT_Q_IDB_KEY); if(Array.isArray(v)) fromIdb=v; }
+    catch(e){ idbOk=false; }
+  }
+  try{ const v=JSON.parse(localStorage.getItem(XACCT_Q_LS_KEY)||'[]'); if(Array.isArray(v)) fromLs=v; }
+  catch(e){ lsOk=false; }
+  const seen=new Set(), out=[];
+  for(const e of fromIdb.concat(fromLs)){ if(e && !seen.has(e.id)){ seen.add(e.id); out.push(e); } }
+  return {list:out, ok:idbOk&&lsOk};
+}
+
+function _xacctQuarantine(data, info){
+  const run=async()=>{
+    const payload=JSON.parse(JSON.stringify(data));
+    const contentKey=JSON.stringify({e:payload.entities||null,c:(payload.meta&&payload.meta.cloudBackup)||null});
+    const read=await _xacctReadQuarantine();
+    if(!read.ok){
+      // Could not confirm what is already safely stored; writing now would
+      // risk silently replacing it. Refuse — the caller (doSignOut / the
+      // adoption path) treats a false return the same as any other
+      // quarantine failure and does not proceed with its destructive step.
+      console.error('[account isolation] could not verify existing quarantine before writing — refusing to write, nothing was overwritten');
+      return false;
+    }
+    const list=read.list;
+    if(list.some(e=>e.contentKey===contentKey && e.recordedOwnerUid===(info.recordedOwnerUid||null))) return true;
+    const entry={id:'xq-'+Date.now().toString(36)+'-'+Math.random().toString(36).slice(2),
+      at:new Date().toISOString(), reason:info.reason, source:info.source||null,
+      recordedOwnerUid:info.recordedOwnerUid||null, signedInUid:info.signedInUid||null,
+      contentKey, payload};
+    const next=list.concat([entry]);
+    if(idbReady && _idbHandle){
+      try{
+        await idbSet(XACCT_Q_IDB_KEY,next);
+        const back=await idbGet(XACCT_Q_IDB_KEY);
+        if(Array.isArray(back) && back.some(e=>e.id===entry.id)){ console.warn('[account isolation] quarantined',info.reason,'owner:',entry.recordedOwnerUid,'signed-in:',entry.signedInUid); return true; }
+      }catch(e){}
+    }
+    try{
+      localStorage.setItem(XACCT_Q_LS_KEY,JSON.stringify(next));
+      const back=JSON.parse(localStorage.getItem(XACCT_Q_LS_KEY)||'[]');
+      return Array.isArray(back) && back.some(e=>e.id===entry.id);
+    }catch(e){ return false; }
+  };
+  const p=_xacctChain.then(run,run);
+  _xacctChain=p.catch(()=>{});
+  return p;
+}
+
+function _readLocalStorageCacheRaw(){
+  try{ const raw=localStorage.getItem(KEY); if(!raw) return null; const d=JSON.parse(raw); return (d&&d.entities)?d:null; }catch(e){ return null; }
+}
+
+function _xacctHasUnsentLocal(d){
+  // A database with no user data at all (only the default inbox) has nothing
+  // worth keeping, even if that inbox is still queued for its first sync.
+  if(!_xacctHasUserData(d)) return false;
+  const cb=(d&&d.meta&&d.meta.cloudBackup)||{};
+  if((cb.pendingChanges||[]).length || (cb.conflicts||[]).length) return true;
+  if(typeof cb.lastPushedSaveSeq!=='number') return true;
+  return typeof d.meta._saveSeq==='number' && d.meta._saveSeq>cb.lastPushedSaveSeq;
+}
+
+function _bootBlankDB(){
+  const d=seedDB(blankDB());
+  const raw=_readLocalStorageCacheRaw();
+  if(raw && raw.meta) for(const k of ['theme','lang','accent']) if(k in raw.meta) d.meta[k]=raw.meta[k];
+  return d;
+}
+
+function _cacheCandidateNewer(a,b){
+  const as=(a.data.meta&&typeof a.data.meta._saveSeq==='number')?a.data.meta._saveSeq:null;
+  const bs=(b.data.meta&&typeof b.data.meta._saveSeq==='number')?b.data.meta._saveSeq:null;
+  if(as!==null && bs!==null){ if(as!==bs) return as>bs; return a.rank>b.rank; }
+  if(as!==null) return true;
+  if(bs!==null) return false;
+  const at=(a.data.meta&&a.data.meta._savedAt)||'', bt=(b.data.meta&&b.data.meta._savedAt)||'';
+  if(at!==bt) return at>bt;
+  return a.rank>b.rank;
+}
+
+async function _adoptLocalDataFor(uid, alive){
+  if(_idbReadyPromise){
+    const res=await Promise.race([_idbReadyPromise.then(()=>'ok',()=>'ok'), new Promise(r=>setTimeout(()=>r('timeout'),8000))]);
+    if(res==='timeout'){ _idbOpenTimedOut=true; idbReady=false; }
+  }
+  if(!alive()) return {ok:false,reason:'superseded'};
+  // A store that exists but cannot be read is NOT an empty store: continuing
+  // would start empty and the first save would overwrite the only copy.
+  if(!idbReady){
+    let usedBefore=false; try{ usedBefore=localStorage.getItem(IDB_IN_USE_LS_KEY)==='1'; }catch(e){}
+    if(usedBefore || _idbReadFailed) return {ok:false,reason:'storage-read-failed'};
+  }
+  const cands=[];
+  if(DB && _xacctHasUserData(DB)) cands.push({source:'memory',data:DB,owner:(DB.meta&&DB.meta.userId)||null,rank:3});
+  if(idbReady && _idbHandle){
+    let v=null;
+    try{ v=await idbGet(IDB_BLOB_KEY); }catch(e){ return {ok:false,reason:'storage-read-failed'}; }
+    if(!alive()) return {ok:false,reason:'superseded'};
+    if(v && v.entities) cands.push({source:'indexeddb',data:v,owner:(v.meta&&v.meta.userId)||null,rank:2});
+  }
+  const ls=_readLocalStorageCacheRaw();
+  if(ls) cands.push({source:'localStorage',data:ls,owner:(ls.meta&&ls.meta.userId)||null,rank:1});
+  const eligible=cands.filter(c=>c.owner===uid);
+  const foreign=cands.filter(c=>c.owner!==uid && _xacctHasUserData(c.data));
+  for(const c of foreign){
+    const ok=await _xacctQuarantine(c.data,{reason:c.owner?'owner-mismatch':'owner-unknown',recordedOwnerUid:c.owner,signedInUid:uid,source:c.source});
+    if(!alive()) return {ok:false,reason:'superseded'};
+    if(!ok) return {ok:false,reason:'quarantine-failed'};
+  }
+  let winner=null;
+  for(const c of eligible) if(!winner || _cacheCandidateNewer(c,winner)) winner=c;
+  let next;
+  // Use ONLY the snapshot whose owner was verified above. Re-reading storage
+  // here (e.g. loadDB()) would pick up whatever another tab wrote during the
+  // quarantine awaits — i.e. data whose owner was never checked.
+  if(winner && winner.source==='memory') next=DB;
+  else if(winner) next=_normalizeDB(JSON.parse(JSON.stringify(winner.data)));
+  else{ next=seedDB(blankDB()); for(const k of ['theme','lang','accent']) if(DB&&DB.meta&&k in DB.meta) next.meta[k]=DB.meta[k]; }
+  if(!alive()) return {ok:false,reason:'superseded'};
+  next.meta.userId=uid;
+  DB=next;
+  return {ok:true,adopted:winner?winner.source:null,quarantined:foreign.length};
+}
+
+function _normalizeDB(d){
+  try{
+    // ensure all entity collections exist
+    ['tasks','lists','people','events','expenses','notes','places','shopLists','shopItems','noteItems','noteFolders','payments','payFolders','vaultItems','vaultFolders','documents','docFolders','trips','tripReminderDone','docReminderDone','_docPayLinks','familyMembers','familyPlaces','familyPets','familyKeys','familyInvites','familyTimeline','famLocations','famRoutes','famConsent']
+      .forEach(e=>{if(!d.entities[e])d.entities[e]={};});
+    // ── Travel data repair (safe, no data loss) ──
+    try{
+      Object.values(d.entities.trips||{}).forEach(t=>{
+        if(!t||typeof t!=='object')return;
+        // Repair swapped/invalid dates: if end < start, swap them (preserves both values).
+        if(t.startDate&&t.endDate&&t.endDate<t.startDate){ const tmp=t.startDate; t.startDate=t.endDate; t.endDate=tmp; }
+        // Backfill a meaningful title for legacy "New trip"/empty placeholders using known fields.
+        if(!t.title||/^new trip$/i.test(t.title.trim())){
+          const place=t.city||t.destination||t.country||'';
+          if(place){ let nights=0; if(t.startDate&&t.endDate){ const s=new Date(t.startDate+'T00:00:00'),e=new Date(t.endDate+'T00:00:00'); if(!isNaN(s)&&!isNaN(e))nights=Math.max(0,Math.round((e-s)/86400000)); }
+            t.title = nights>=10?`${place} Holiday`:nights>=6?`A Week in ${place}`:nights>=3?`${place} Getaway`:nights>=1?`${place} Weekend`:`Trip to ${place}`;
+          }
+        }
+        // Ensure new segment fields exist on old segments (non-destructive).
+        (t.segments||[]).forEach(sg=>{ ['vehicleNo','depPoint','arrPoint'].forEach(k=>{ if(sg[k]===undefined)sg[k]=''; }); if(sg.distanceKm===undefined)sg.distanceKm=0; if(sg.durationH===undefined)sg.durationH=0; });
+      });
+    }catch(_){}
+    if(!d.meta)d.meta={};
+    if(!d.meta.viewSort)d.meta.viewSort={};
+    if(!d.meta.viewOrder)d.meta.viewOrder={};
+    if(d.meta.addOnTop===undefined)d.meta.addOnTop=true;
+    if(d.meta.starTop===undefined)d.meta.starTop=true;
+    if(d.meta.soundOn===undefined)d.meta.soundOn=true;
+    if(d.meta.confirmDel===undefined)d.meta.confirmDel=true;
+    if(d.meta.pushEnabled===undefined)d.meta.pushEnabled=false;
+    if(d.meta.notifPermGranted===undefined)d.meta.notifPermGranted=false;
+    if(d.meta.notifPrefs===undefined)d.meta.notifPrefs={taskReminders:true,dueToday:true,sharedActivity:true};
+    if(d.meta.accent===undefined)d.meta.accent=null;
+    if(d.meta.showDueMyDay===undefined)d.meta.showDueMyDay=true;
+    if(d.meta.recogniseDates===undefined)d.meta.recogniseDates=true;
+    if(d.meta.removeDates===undefined)d.meta.removeDates=false;
+    if(d.meta.weekStart===undefined)d.meta.weekStart='system';
+    if(d.meta.autoHideSmart===undefined)d.meta.autoHideSmart=false;
+    if(!d.meta.smartShow||typeof d.meta.smartShow!=='object')d.meta.smartShow={};
+    ['myday','important','planned','assigned','all'].forEach(k=>{if(d.meta.smartShow[k]===undefined)d.meta.smartShow[k]=true;});
+    if(!Array.isArray(d.meta.groups))d.meta.groups=[];
+    if(!Object.keys(d.entities.lists).length)seedDB(d);
+    // ── Activity layer state (history-only; never touches canonical data) ──
+    if(!d.meta.familyServer||typeof d.meta.familyServer!=='object')d.meta.familyServer={};
+    // ── Phase 1: legacy local invitations are NOT cloud invitations. Mark them
+    // legacy (non-destructive) so they never render/count as cloud invites. ──
+    try{ if(!d.meta._famInviteMigrated){ Object.values(d.entities.familyInvites||{}).forEach(inv=>{ if(inv&&!inv.server){ inv.legacy=true; } }); d.meta._famInviteMigrated=true; } }catch(_){}
+    // Phase 2 Stage 1: ensure location entities exist (additive, no data touched).
+    if(!d.entities.famLocations||typeof d.entities.famLocations!=='object')d.entities.famLocations={};
+    if(!d.entities.famRoutes||typeof d.entities.famRoutes!=='object')d.entities.famRoutes={};
+    if(!d.entities.famConsent||typeof d.entities.famConsent!=='object')d.entities.famConsent={};
+    if(!d.entities.famEvents||typeof d.entities.famEvents!=='object')d.entities.famEvents={};
+    if(!d.entities.famGeoState||typeof d.entities.famGeoState!=='object')d.entities.famGeoState={};
+    if(!d.entities.famNoShow||typeof d.entities.famNoShow!=='object')d.entities.famNoShow={};
+    if(!d.entities.activity)d.entities.activity={};
+    if(d.meta.activityRetentionDays===undefined)d.meta.activityRetentionDays=0; // 0 = Forever
+    if(!d.meta.activityHidden||typeof d.meta.activityHidden!=='object')d.meta.activityHidden={};
+    // Enforce retention on the STORED ephemeral log only (bounded storage).
+    try{ const days=d.meta.activityRetentionDays|0; if(days>0){ const cut=Date.now()-days*864e5; Object.values(d.entities.activity).forEach(e=>{ const t=Date.parse(e.at||''); if(!isNaN(t)&&t<cut)delete d.entities.activity[e.id]; }); } }catch(_){}
+    return d;
+  }catch(e){ return d; } // never drop data because a repair step failed
+}
+
+function _resumeAsOwner(uid){
+  if(!uid || !FB.user || FB.user.uid!==uid) return; // a different identity already took over; nothing to resume
+  _setDbOwner(uid);
+  startListeners();
+  try{ pullProfile(); }catch(e){}
+}
+
 async function idbMigrateAndLoad(){
+  // ACCOUNT ISOLATION: this only opens storage. It never reads a cached copy
+  // into DB and never renders — before the signed-in account is known there
+  // is nobody to verify the data against (see _adoptLocalDataFor).
   try{
     _idbHandle=await idbOpen();
   }catch(e){
@@ -3792,58 +3973,23 @@ async function idbMigrateAndLoad(){
     idbReady=false;
     return;
   }
+  if(_idbOpenTimedOut){ idbReady=false; return; } // a sign-in already proceeded without IndexedDB; never switch stores mid-session
   try{
     const existing=await idbGet(IDB_BLOB_KEY);
-    if(existing && existing.entities){
-      // v[TEST BUILD BUGFIX 5, re-applied after Codex review found it had
-      // regressed to two-state in this file] Prefer the monotonic
-      // _saveSeq counter over the wall-clock _savedAt string — a device
-      // clock tying or moving backward made this comparison pick the
-      // wrong store (see bumpSaveStamp()'s comment). Four cases, in
-      // order: (1) both sides have _saveSeq → compare counters; (2) only
-      // IndexedDB has one → IndexedDB wins outright (it went through a
-      // real save under the new code; the other side predates _saveSeq
-      // entirely, and its clock is not a trustworthy tiebreaker against a
-      // side that HAS a counter — this is also what protects against
-      // "one of the two storage locations failed to write" leaving that
-      // side seq-less); (3) only the in-memory/current copy has one →
-      // current wins outright, same reasoning, mirrored; (4) neither side
-      // has one → fall back to the old timestamp-only comparison
-      // (legacy, pre-_saveSeq data only).
-      const idbSeq=(existing.meta&&typeof existing.meta._saveSeq==='number')?existing.meta._saveSeq:null;
-      const curSeq=(DB.meta&&typeof DB.meta._saveSeq==='number')?DB.meta._saveSeq:null;
-      let idbWins;
-      if(idbSeq!==null && curSeq!==null){
-        idbWins=idbSeq>=curSeq;
-      }else if(idbSeq!==null){
-        idbWins=true;
-      }else if(curSeq!==null){
-        idbWins=false;
-      }else{
-        const idbTime=(existing.meta&&existing.meta._savedAt)||'';
-        const curTime=(DB.meta&&DB.meta._savedAt)||'';
-        idbWins=idbTime>=curTime;
-      }
-      if(idbWins){
-        DB.entities=existing.entities;
-        // Never let a stale IDB copy override the auth identity of the
-        // session currently signing in.
-        DB.meta=Object.assign({},existing.meta,{
-          userId:DB.meta.userId,displayName:DB.meta.displayName,
-          email:DB.meta.email,photoURL:DB.meta.photoURL
-        });
-        render();
-      }
-    }else{
-      // First run under IndexedDB: back up whatever localStorage had, then
-      // copy it in verbatim. Nothing is dropped.
-      downloadJSONBackup(DB,'mbmlife_backup_pre_idb_migration');
-      await idbSet(IDB_BLOB_KEY,DB);
+    if(!(existing && existing.entities)){
+      // First run under IndexedDB: copy the UNTOUCHED localStorage cache in
+      // verbatim, including its recorded owner. Nothing is dropped or adopted.
+      const localRaw=loadDB();
+      downloadJSONBackup(localRaw,'mbmlife_backup_pre_idb_migration');
+      await idbSet(IDB_BLOB_KEY,localRaw);
     }
+    if(_idbOpenTimedOut){ idbReady=false; return; }
     idbReady=true;
+    try{ localStorage.setItem(IDB_IN_USE_LS_KEY,'1'); }catch(e){}
     clearSaveError();
   }catch(e){
-    console.warn('IndexedDB migration failed — staying on localStorage:',e);
+    console.warn('IndexedDB could not be read — sign-in will stop rather than start empty:',e);
+    _idbReadFailed=true;
     idbReady=false;
   }
 }
@@ -26589,6 +26735,79 @@ function sessionMode(){ return (FB.user && FB.user.email) ? 'google' : null; }
 function sessionCap(cap){ const m=sessionMode(); return !!(m && SESSION_CAPS[m] && SESSION_CAPS[m][cap]); }
 
 /* ── Auth state ── */
+async function _onAuthUser(user){
+  const epoch=++_authEpoch;
+  const alive=()=>epoch===_authEpoch && !!FB.auth && !!FB.auth.currentUser && FB.auth.currentUser.uid===user.uid;
+  if(_dbOwnerUid!==user.uid){
+    // Not (yet) verified for this uid — including a repeat callback that
+    // arrives while an earlier check for the same uid is still running.
+    _setDbOwner(null);
+    FB.user=null;
+    try{stopListeners();}catch(e){}
+    const adopt=await _adoptLocalDataFor(user.uid, alive);
+    if(!alive()) return;                       // signed out / switched meanwhile: do nothing at all
+    if(!adopt.ok){
+      console.error('[account isolation] could not safely separate cached data; nothing was shown, saved or sent:',adopt.reason);
+      const readFail=adopt.reason==='storage-read-failed';
+      try{ showAuthScreen(); authError(readFail
+        ? (L==='fa'?'اطلاعاتِ ذخیره‌شده در این دستگاه خوانده نشد. چیزی تغییر نکرد. اپ را دوباره باز کنید.':'Data stored on this device could not be read. Nothing was changed. Please reopen the app.')
+        : (L==='fa'?'جداسازیِ امنِ اطلاعاتِ این دستگاه ممکن نشد. چیزی حذف یا ارسال نشد. اپ را دوباره باز کنید.':'Could not safely separate data stored on this device. Nothing was deleted or sent. Please reopen the app.')); }catch(e){}
+      return;
+    }
+    DB.meta.userId=user.uid;
+    _setDbOwner(user.uid);
+    if(adopt.quarantined>0){
+      // The other account's copy is already verified in quarantine; now
+      // durably replace it in the primary cache slots (IndexedDB + the
+      // localStorage mirror) instead of leaving it there until a later save.
+      const saved=await _cloudBackupPersistLocalAwaited();
+      if(!alive()) return;
+      if(!saved) console.error('[account isolation] primary cache could not be overwritten yet; its foreign copy is quarantined and will never be adopted for this account');
+    }
+  }
+  FB.user=user;
+  DB.meta.userId=user.uid;
+  DB.meta.displayName=user.displayName||user.email||'User';
+  DB.meta.email=user.email||null;
+  DB.meta.photoURL=user.photoURL||null;
+  DB.meta.provider='google';
+  // v[next] FIX (code review, 2026-09-08): this MUST be awaited —
+  // saveDB()/render()/startListeners() below must never run
+  // concurrently with a fresh-install restore still in flight, or the
+  // freshly-seeded EMPTY DB could get persisted/rendered/listened-on
+  // a moment before the real data arrives. Only acts when the local
+  // DB is genuinely empty (see cloudBackupIsLocalEmpty), so this is a
+  // fast no-op for any account that already has local data.
+  // test build's actual boot-restore prompt (this build has no separate auto-restore function)
+  try{ if(typeof cloudBackupPromptOnBoot==='function') await cloudBackupPromptOnBoot(); }catch(e){ console.error('cloudBackupPromptOnBoot threw (continuing boot with local/empty state):', e); }
+  if(!alive()) return;                         // sign-out / switch during restore: never re-set FB.user or save
+  saveDB();
+  startListeners();
+  try{ if(window._pendingFamilyInvite && typeof FamilyBackend!=='undefined'){ FamilyBackend.setPending(window._pendingFamilyInvite); currentModule='family'; screen='module'; famView='joinInvite'; } }catch(e){}
+  pullProfile();
+  refreshPushOnStart();
+  hideSplash();
+  const as=document.getElementById('auth-screen');
+  if(as)as.style.display='none';
+  const appEl=document.getElementById('app');
+  if(appEl&&appEl.style.display==='none'){
+    appEl.style.display='flex';
+    render();
+    setTimeout(checkForUpdate,3000);
+  } else {
+    render();
+  }
+}
+function _onAuthSignedOut(){
+  _authEpoch++;
+  _setDbOwner(null);
+  FB.user=null;
+  stopListeners();
+  // No signed-in user (fresh boot with no session, or after Sign out):
+  // reveal the Login screen. Never open the app from cached data.
+  hideSplash();
+  showAuthScreen();
+}
 function initAuth(){
   if(!FB.ready){
     // Production: never open the app from cached local data.
@@ -26597,56 +26816,7 @@ function initAuth(){
     authError(L==='fa'?'سرویس ورود در دسترس نیست. اتصال اینترنت را بررسی کنید و دوباره باز کنید.':'Sign-in service unavailable. Check your connection and reopen.');
     return;
   }
-  FB.auth.onAuthStateChanged(async user=>{
-    if(user){
-      // SECURITY: if a different account signs in on this device, discard the
-      // previous user's locally cached data so it is never shown to the new
-      // user. Firestore listeners will repopulate this user's own data.
-      const prevUid=DB.meta.userId;
-      if(prevUid && prevUid!==user.uid){
-        DB=seedDB(blankDB());
-        try{localStorage.removeItem(KEY);}catch(e){}
-        idbDelete(IDB_BLOB_KEY);
-      }
-      FB.user=user;
-      DB.meta.userId=user.uid;
-      DB.meta.displayName=user.displayName||user.email||'User';
-      DB.meta.email=user.email||null;
-      DB.meta.photoURL=user.photoURL||null;
-      DB.meta.provider='google';
-      // v[next] FIX (code review, 2026-09-08): this MUST be awaited —
-      // saveDB()/render()/startListeners() below must never run
-      // concurrently with a fresh-install restore still in flight, or the
-      // freshly-seeded EMPTY DB could get persisted/rendered/listened-on
-      // a moment before the real data arrives. Only acts when the local
-      // DB is genuinely empty (see cloudBackupIsLocalEmpty), so this is a
-      // fast no-op for any account that already has local data.
-      try{ if(typeof cloudBackupPromptOnBoot==='function') await cloudBackupPromptOnBoot(); }catch(e){ console.error('cloudBackupPromptOnBoot threw (continuing boot with local/empty state):', e); }
-      saveDB();
-      startListeners();
-      try{ if(window._pendingFamilyInvite && typeof FamilyBackend!=='undefined'){ FamilyBackend.setPending(window._pendingFamilyInvite); currentModule='family'; screen='module'; famView='joinInvite'; } }catch(e){}
-      pullProfile();
-      refreshPushOnStart();
-      hideSplash();
-      const as=document.getElementById('auth-screen');
-      if(as)as.style.display='none';
-      const appEl=document.getElementById('app');
-      if(appEl&&appEl.style.display==='none'){
-        appEl.style.display='flex';
-        render();
-        setTimeout(checkForUpdate,3000);
-      } else {
-        render();
-      }
-    } else {
-      FB.user=null;
-      stopListeners();
-      // No signed-in user (fresh boot with no session, or after Sign out):
-      // reveal the Login screen. Never open the app from cached data.
-      hideSplash();
-      showAuthScreen();
-    }
-  });
+  FB.auth.onAuthStateChanged(user=>{ if(user) return _onAuthUser(user); _onAuthSignedOut(); });
 }
 
 /* ── Google Sign-In (popup only — no redirect) ── */
@@ -26715,11 +26885,55 @@ function showAuthScreen(){
 }
 
 /* ── Sign out without relying on reload ── */
-function doSignOut(){
+async function doSignOut(){
+  // ACCOUNT ISOLATION: sign-out may wipe this device, but never data that has
+  // not reached the server/backup yet — that is quarantined (verified) first,
+  // and if it cannot be saved safely the sign-out is cancelled. myEpoch also
+  // guards against two separate races: (a) an edit landing — and being
+  // saved — WHILE this function's own awaits are in flight, after this
+  // function already took its quarantine snapshot; and (b) a DIFFERENT
+  // account signing in while this sign-out is still stalled on an await, in
+  // which case this continuation must never touch that account's session,
+  // storage, or screen — only _onAuthUser may do that, using its own token.
+  const myEpoch=++_authEpoch;
+  const owned=_dbOwnedByCurrentUser() ? _dbOwnerUid : null;
+  _setDbOwner(null);     // no owner confirmed while sign-out is in progress
   if(typeof voiceHardStop==='function')voiceHardStop();
   if(typeof VaultSession!=='undefined'){ VaultSession.lock(); _vaultReveal={}; vaultView='home'; vaultActiveId=null; }
   stopListeners();
   try{removeDeviceToken();}catch(e){}
+
+  if(owned && _xacctHasUnsentLocal(DB)){
+    // Bounded retry, keyed on a fingerprint of DB (not _xacctHasUnsentLocal,
+    // which stays true even after a successful quarantine — quarantining
+    // copies the data out, it does not clear DB's own pending/seq markers).
+    // Loop until the fingerprint taken right before an attempt matches the
+    // fingerprint taken right after it: nothing changed DURING that await,
+    // so nothing could have been missed by the snapshot it captured.
+    let converged=false;
+    for(let attempt=0; attempt<5 && !converged; attempt++){
+      if(myEpoch!==_authEpoch) return false; // a different account has since signed in or out; do not touch its storage
+      const before=JSON.stringify(DB.entities)+'\u0000'+JSON.stringify(DB.meta.cloudBackup||null); // exact comparison
+      const ok=await _xacctQuarantine(DB,{reason:'sign-out-unsent',recordedOwnerUid:owned,signedInUid:null,source:'memory'});
+      if(myEpoch!==_authEpoch) return false;
+      if(!ok){
+        _resumeAsOwner(owned); // still the same session — do not leave it half signed-out
+        try{ toast(L==='fa'?'خروج لغو شد: اطلاعاتِ ارسال‌نشده به‌طورِ امن ذخیره نشد.':'Sign-out cancelled: unsent data could not be saved safely on this device.'); }catch(e){}
+        return false;
+      }
+      const after=JSON.stringify(DB.entities)+'\u0000'+JSON.stringify(DB.meta.cloudBackup||null);
+      converged=(before===after);
+    }
+    if(!converged){
+      // Kept changing through every retry — do not guess which version is
+      // "final"; refuse rather than risk wiping something never captured.
+      _resumeAsOwner(owned);
+      try{ toast(L==='fa'?'خروج لغو شد: ویرایش‌ها هنوز ادامه دارند.':'Sign-out cancelled: edits are still coming in.'); }catch(e){}
+      return false;
+    }
+  }
+
+  if(myEpoch!==_authEpoch) return false;
   DB.meta.userId=null;
   DB.meta.displayName=null;
   DB.meta.email=null;
@@ -26727,30 +26941,41 @@ function doSignOut(){
   DB.meta.photo=null;
   DB.meta.avatar=null;
   DB.meta.provider=null;
-  // SECURITY: wipe this user's cached data from the device on sign-out.
+  // SECURITY: wipe this user's cached data from the device on sign-out —
+  // but only storage verified to be THIS user's. Storage whose owner was
+  // never verified (e.g. a sign-in that stopped on a read error) is left
+  // untouched; the next sign-in checks its owner.
   DB=seedDB(blankDB());
-  try{localStorage.removeItem(KEY);}catch(e){}
-  idbDelete(IDB_BLOB_KEY);
+  if(owned){
+    try{localStorage.removeItem(KEY);}catch(e){}
+    try{ await idbDelete(IDB_BLOB_KEY); }catch(e){}
+    if(myEpoch!==_authEpoch) return false; // a newer identity may already be writing its own data
+  }
   saveDB();
+  if(myEpoch!==_authEpoch) return false;
   FB.user=null;
-  const finish=()=>showAuthScreen();
+  const finish=()=>{ if(myEpoch===_authEpoch) showAuthScreen(); };
   if(FB.ready&&FB.auth){
     FB.auth.signOut().then(finish).catch(finish);
   }else{
     finish();
   }
+  return true;
 }
 
 /* ── Firestore listeners ── */
 function startListeners(){
   if(!FB.ready||!FB.user)return;
   if(!sessionCap('sync'))return;   // guest (future) = local-only, no Firestore reads
+  if(!_dbOwnedByCurrentUser())return; // ACCOUNT ISOLATION
   stopListeners();
+  const idTok=_identityToken();
   const ws=wsId(FB.user.uid);
   const db=FB.db;
 
   const sync=(col,entity)=>db.collection('workspaces').doc(ws).collection(col)
     .onSnapshot(snap=>{
+      if(!_identityStillValid(idTok)) return; // ACCOUNT ISOLATION: a late event from a previous identity's listener
       _ensureSyncQueues();
       snap.docChanges().forEach(ch=>{
         // Fix (Codex review round 1, regression 1): a pending unsent local
@@ -26792,6 +27017,7 @@ function startListeners(){
   const u3=sync('appts','appts');
   _syncUnsubs=[u1,u2,u3];
   setTimeout(()=>{
+    if(!_identityStillValid(idTok)) return;
     if(FB.auth&&FB.auth.currentUser&&DB.meta.cloudBackup&&DB.meta.cloudBackup.pendingChanges&&DB.meta.cloudBackup.pendingChanges.length) syncPushSafe().catch(()=>{});
   },0);
   try{ if(typeof FamilyBackend!=='undefined'){ FamilyBackend.start(); if(FamilyBackend.driving&&FamilyBackend.driving.recoverOnStart)FamilyBackend.driving.recoverOnStart(); } }catch(e){}
@@ -26800,6 +27026,7 @@ function startListeners(){
 function stopListeners(){
   _syncUnsubs.forEach(u=>{try{u();}catch(e){}});
   _syncUnsubs=[];
+  if(_profileUnsub){ try{_profileUnsub();}catch(e){} _profileUnsub=null; }
   try{ if(typeof FamilyBackend!=='undefined')FamilyBackend.stop(); }catch(e){}
 }
 
@@ -26907,14 +27134,16 @@ async function _csTimedCommit(ref,operation){
 
 async function _csApplyRestore(uid,manifest,ackVersion){
   if(FB._syncInFlight || FB._resolutionInFlight || FB._restoreInFlight || (FB._syncTransactions&&FB._syncTransactions.size)) return {ok:false,reason:'operation-in-progress'};
+  if(!_dbOwnedByCurrentUser()) return {ok:false,reason:'ownership-unconfirmed'}; // ACCOUNT ISOLATION
+  const idTok=_identityToken();
   FB._restoreInFlight=true;
   const before=_csCopy(DB.entities);
   try{stopListeners();}catch(e){}
   try{
     const {restoredEntities,restoredMeta}=await _cloudBackupFetchVersionEntities(uid,manifest.version,manifest.entityCounts);
-    if(cloudBackupUid()!==uid) return {ok:false,reason:'account-changed'};
+    if(cloudBackupUid()!==uid || !_identityStillValid(idTok)) return {ok:false,reason:'account-changed'};
     const result=await _cloudBackupReconcileLiveSyncSafe(restoredEntities);
-    if(cloudBackupUid()!==uid) return {ok:false,reason:'account-changed'};
+    if(cloudBackupUid()!==uid || !_identityStillValid(idTok)) return {ok:false,reason:'account-changed'};
     const current=DB.entities, merged=_csCopy(current);
     for(const [type,items] of Object.entries(restoredEntities||{})){
       if(LIVE_SYNC_TYPES.includes(type)){
@@ -26941,7 +27170,7 @@ async function _csApplyRestore(uid,manifest,ackVersion){
   }catch(e){return {ok:false,reason:'pull-failed',error:e.message};}
   finally{
     FB._restoreInFlight=false;
-    try{if(FB.user&&cloudBackupUid()===uid)startListeners();}catch(e){}
+    try{if(FB.user&&cloudBackupUid()===uid&&_identityStillValid(idTok))startListeners();}catch(e){}
   }
 }
 
@@ -26954,9 +27183,17 @@ function _ensureSyncQueues(){
   const cb=DB.meta.cloudBackup;
   if(!Array.isArray(cb.pendingChanges)) cb.pendingChanges=[];
   if(!Array.isArray(cb.conflicts)) cb.conflicts=[];
+  for(const conflict of cb.conflicts) if(!conflict.conflictId) conflict.conflictId=_csId();
+  // ACCOUNT ISOLATION: this used to stamp every owner-less entry with
+  // whoever was signed in at that moment — so another account's queued
+  // changes or conflicts became "yours" just by being on this device.
+  // Now an owner-less entry is attributed only to the VERIFIED owner of the
+  // database that contains it; while ownership is unconfirmed it stays
+  // owner-less (and is therefore never synced, shown or resolved).
+  if(!_dbOwnedByCurrentUser()) return;
   const owner=cloudBackupUid();
   for(const entry of cb.pendingChanges) if(!entry.ownerUid) entry.ownerUid=owner;
-  for(const conflict of cb.conflicts){if(!conflict.conflictId) conflict.conflictId=_csId();if(!conflict.ownerUid) conflict.ownerUid=owner;}
+  for(const conflict of cb.conflicts) if(!conflict.ownerUid) conflict.ownerUid=owner;
 }
 
 // Queues an item for sync, capturing the base version THIS edit was made
@@ -26984,6 +27221,7 @@ function queueSyncItem(entityType,id,baseV){
 // (there are many) while still capturing an accurate per-item base
 // version at the moment each change is first noticed.
 function detectAndQueueChangedItems(){
+  if(!_dbOwnedByCurrentUser()) return; // ACCOUNT ISOLATION: never tag unverified data with the signed-in uid
   _ensureSyncQueues();
   const cb=DB.meta.cloudBackup;
   if(!cb._lastSeenContent) cb._lastSeenContent={};
@@ -26997,6 +27235,7 @@ function detectAndQueueChangedItems(){
 // this is what makes the base version meaningful: it reflects what this
 // device last confirmed from the server at EDIT time.
 function scheduleSafeSync(entityType,id){
+  if(!_dbOwnedByCurrentUser()) return; // ACCOUNT ISOLATION
   const item=DB.entities[entityType]&&DB.entities[entityType][id];
   if(item) queueSyncItem(entityType,id,typeof item._lastSyncedV==='number'?item._lastSyncedV:null);
 }
@@ -27013,20 +27252,24 @@ async function _syncOneItem(entityType,id,baseV,ws,uidOfCaller){
   _ensureSyncQueues();
   const owner=uidOfCaller||cloudBackupUid();
   if(owner!==cloudBackupUid()) return {ok:false,reason:'account-changed'};
+  if(!_dbOwnedByCurrentUser()) return {ok:false,reason:'ownership-unconfirmed'}; // ACCOUNT ISOLATION
+  const idTok=_identityToken();
   const entry=queueSyncItem(entityType,id,baseV);
   if(!entry) return {ok:true,skipped:'no-local-item'};
   if(!entry.attempt) entry.attempt=_csOperation(entry.payload,entry.baseV,entry.baseSnapshot,owner);
   const operation=entry.attempt;
   // Both the payload and operation identity must survive closing the app.
   if(!await _csPersist()) return {ok:false,reason:'local-save-failed'};
+  if(!_identityStillValid(idTok)) return {ok:false,reason:'account-changed'};
   const ref=FB.db.collection('workspaces').doc(ws).collection(entityType).doc(id);
   try{
     const result=await _csTimedCommit(ref,operation);
-    if(owner!==cloudBackupUid()) return {ok:false,reason:'account-changed'};
+    if(owner!==cloudBackupUid() || !_identityStillValid(idTok)) return {ok:false,reason:'account-changed'};
     const item=DB.entities[entityType]&&DB.entities[entityType][id];
     if(item){item._lastSyncedV=result.writtenV;item._lastKnownServerUpdatedAt=operation.payload.updatedAt;item._v=result.writtenV;item._syncBase=_csCopy(result.serverItem);}
     return Object.assign({ok:true,payload:operation.payload,opId:operation.opId},result);
   }catch(e){
+    if(!_identityStillValid(idTok)) return {ok:false,reason:'account-changed'};
     if(e.code==='version-conflict'){
       if(!DB.meta.cloudBackup.conflicts.some(c=>c.operation&&c.operation.opId===operation.opId)){
         DB.meta.cloudBackup.conflicts.push({conflictId:_csId(),ownerUid:owner,entityType,id,source:'sync',operation:_csCopy(operation),localItem:_csCopy((DB.entities[entityType]||{})[id]||entry.payload),serverItem:_csCopy(e.serverSnapshot),detectedAt:new Date().toISOString()});
@@ -27059,6 +27302,8 @@ async function resolveConflict(conflictIndex,choice){
   if(!['local','server','backup'].includes(choice)) return {ok:false,reason:'invalid-choice'};
   const owner=cloudBackupUid();
   if(!owner || conflict.ownerUid!==owner) return {ok:false,reason:'not-signed-in'};
+  if(!_dbOwnedByCurrentUser()) return {ok:false,reason:'ownership-unconfirmed'}; // ACCOUNT ISOLATION
+  const idTok=_identityToken();
   if(FB._syncInFlight || FB._restoreInFlight || FB._resolutionInFlight || (FB._syncTransactions&&FB._syncTransactions.size)) return {ok:false,reason:'operation-in-progress'};
   FB._resolutionInFlight=true;
   try{
@@ -27069,6 +27314,7 @@ async function resolveConflict(conflictIndex,choice){
     let chosen;
     if(choice==='server'){
       const snap=await ref.get({source:'server'});chosen=snap.exists?snap.data():null;
+      if(!_identityStillValid(idTok)) return {ok:false,reason:'account-changed'};
     }else{
       const content=choice==='local'?(conflict.currentLocalItem||conflict.localItem):conflict.backupItem;
       if(!content) return {ok:false,reason:'no-content-for-choice'};
@@ -27079,9 +27325,11 @@ async function resolveConflict(conflictIndex,choice){
         conflict.resolutionChoice=choice;
       }
       if(!await _csPersist()) return {ok:false,reason:'local-save-failed'};
+      if(!_identityStillValid(idTok)) return {ok:false,reason:'account-changed'};
       try{
         const result=await _csCommit(ref,conflict.resolutionAttempt);chosen=result.serverItem;
       }catch(e){
+        if(!_identityStillValid(idTok)) return {ok:false,reason:'account-changed'};
         if(e.code==='version-conflict'){
           conflict.serverItem=_csCopy(e.serverSnapshot);conflict.driftedAt=new Date().toISOString();delete conflict.resolutionAttempt;delete conflict.resolutionChoice;
           await _csPersist();return {ok:false,reason:'drifted-again',freshServerItem:e.serverSnapshot};
@@ -27089,10 +27337,11 @@ async function resolveConflict(conflictIndex,choice){
         return {ok:false,reason:'write-failed',error:e.code||e.message};
       }
     }
-    if(owner!==cloudBackupUid()) return {ok:false,reason:'account-changed'};
+    if(owner!==cloudBackupUid() || !_identityStillValid(idTok)) return {ok:false,reason:'account-changed'};
     // Journal the accepted outcome while retaining all conflict versions.
     conflict.resolutionCommitted=true;conflict.resolvedServerItem=_csCopy(chosen);
     if(!await _csPersist()) return {ok:false,reason:'local-save-failed',serverCommitted:choice!=='server'};
+    if(!_identityStillValid(idTok)) return {ok:false,reason:'account-changed'};
     if(!DB.entities[type]) DB.entities[type]={};
     const unchanged=_csFingerprint(DB.entities[type][id])===localAtChoice;
     const oldQueue=cb.pendingChanges.filter(e=>e.entityType===type&&e.id===id&&e.ownerUid===owner);
@@ -27120,8 +27369,9 @@ async function syncPushSafe(){
   _ensureSyncQueues();
   if(FB._syncInFlight){FB._syncRerunNeeded=true;return {ok:true,deferred:true};}
   if(FB._restoreInFlight || FB._resolutionInFlight) return {ok:false,reason:'operation-in-progress'};
+  if(!_dbOwnedByCurrentUser()) return {ok:false,reason:'ownership-unconfirmed'}; // ACCOUNT ISOLATION
   FB._syncInFlight=true;
-  const owner=cloudBackupUid();
+  const owner=cloudBackupUid(), idTok=_identityToken();
   try{
     if(!owner) return {ok:false,reason:'not-signed-in'};
     const q=DB.meta.cloudBackup.pendingChanges;
@@ -27131,7 +27381,7 @@ async function syncPushSafe(){
       // Conflicted items stay local until an explicit resolution.
       if(DB.meta.cloudBackup.conflicts.some(c=>c.ownerUid===owner&&c.entityType===entry.entityType&&c.id===entry.id)) continue;
       const r=await _syncOneItem(entry.entityType,entry.id,entry.baseV,wsId(owner),owner);
-      if(owner!==cloudBackupUid()) return {ok:false,reason:'account-changed'};
+      if(owner!==cloudBackupUid() || !_identityStillValid(idTok)) return {ok:false,reason:'account-changed'};
       if(r.ok){
         synced++;
         const item=(DB.entities[entry.entityType]||{})[entry.id];
@@ -27141,6 +27391,7 @@ async function syncPushSafe(){
       }else if(r.reason==='conflict'){conflicted++;const idx=q.indexOf(entry);if(idx>=0)q.splice(idx,1);}
       else retryLater++;
     }
+    if(!_identityStillValid(idTok)) return {ok:false,reason:'account-changed'};
     if(!await _csPersist()) return {ok:false,reason:'local-save-failed',synced,conflicted,retryLater};
     return {ok:true,synced,conflicted,retryLater};
   }finally{
@@ -27158,15 +27409,20 @@ async function syncPushSafe(){
 // it, attempt to drain the queue via real per-item transactions.
 function syncPush(){
   if(!FB.ready||!FB.user)return;
+  if(!_dbOwnedByCurrentUser())return; // ACCOUNT ISOLATION
   if(!sessionCap('sync'))return;
   detectAndQueueChangedItems();
   syncPushSafe().catch(()=>{}); // fire-and-forget, matching the old call site's own contract; failures stay queued for retry
 }
 
 function installReconnectRetry(){
-  if(typeof window !== 'undefined' && window.addEventListener){
-    window.addEventListener('online', ()=>{ syncPushSafe().catch(()=>{}); });
-  }
+  if(typeof window==='undefined' || !window.addEventListener || installReconnectRetry.installed) return;
+  installReconnectRetry.installed=true;
+  window.addEventListener('online', ()=>{
+    if(!FB.ready || !FB.user || (typeof sessionCap==='function' && !sessionCap('sync'))) return;
+    if(!_dbOwnedByCurrentUser()) return; // ACCOUNT ISOLATION
+    syncPushSafe().catch(()=>{});
+  });
 }
 
 
@@ -27185,9 +27441,13 @@ function pushProfile(){
 }
 function pullProfile(){
   if(!FB.ready||!FB.user)return;
+  if(!_dbOwnedByCurrentUser())return; // ACCOUNT ISOLATION
+  if(_profileUnsub){ try{_profileUnsub();}catch(e){} _profileUnsub=null; } // was never unsubscribed: an old account's profile kept writing into the new DB
+  const idTok=_identityToken();
   const ws=wsId(FB.user.uid);
-  FB.db.collection('workspaces').doc(ws).collection('profile').doc('main')
+  _profileUnsub=FB.db.collection('workspaces').doc(ws).collection('profile').doc('main')
     .onSnapshot(snap=>{
+      if(!_identityStillValid(idTok))return;
       if(!snap.exists)return;
       const d=snap.data()||{};
       let changed=false;
@@ -27739,7 +27999,7 @@ function openSettingsSheet(){
       const label=document.getElementById('cb-conflicts-label');
       const panel=document.getElementById('cb-conflicts-panel');
       if(!label||!panel) return;
-      const conflicts=DB.meta.cloudBackup.conflicts||[];
+      const conflicts=_dbOwnedByCurrentUser()?(DB.meta.cloudBackup.conflicts||[]).filter(c=>c&&c.ownerUid===_dbOwnerUid):[]; // ACCOUNT ISOLATION
       if(conflicts.length===0){ label.style.display='none'; panel.style.display='none'; panel.innerHTML=''; return; }
       label.style.display=''; panel.style.display='';
       label.textContent='Conflicts needing your decision ('+conflicts.length+')';

@@ -40,7 +40,7 @@
 // untouched — this file has no way to interfere with Family sync or any
 // other live data.
 
-const CACHE_NAME = 'mbm-life-shell-v593'; // this worker's OWN version identity — bump together with APP_VERSION every release
+const CACHE_NAME = 'mbm-life-shell-v594'; // this worker's OWN version identity — bump together with APP_VERSION every release
 const ACCEPTED_SHELL_CACHE = 'mbm-life-accepted-shell'; // v565: fixed name, NEVER versioned — see header
 const SHELL_URLS = ['./', './index.html'];
 const DB_NAME = 'mbm-life-sw-meta';
