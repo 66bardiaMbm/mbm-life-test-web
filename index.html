@@ -2211,7 +2211,7 @@ try{
     });
   });
 }catch(e){}
-const APP_VERSION='v594';
+const APP_VERSION='v595';
 const SCHEMA=1;
 const KEY='mbmlife_platform_v1';
 /* Global: true when running inside the MBM Life Android companion WebView
@@ -2828,6 +2828,7 @@ function cloudBackupBuildMetaPayload(meta){
 // uploaded successfully.
 async function cloudBackupPush(){
   const uid=cloudBackupUid();
+  _xacctDiag('backup-push-start', {uid});
   if(!uid) return {ok:false, reason:'not-signed-in'};
   if(!_dbOwnedByCurrentUser()) return {ok:false, reason:'ownership-unconfirmed'}; // ACCOUNT ISOLATION: never back up data of unverified ownership
   const idTok=_identityToken();
@@ -2900,12 +2901,22 @@ async function cloudBackupPush(){
     // before this fix.
     let batch=FB.db.batch();
     let opsInBatch=0;
+    let _diagBatchSeq=0;
     const MAX_BATCH_OPS=450; // headroom under Firestore's real 500 cap
-    async function queueWrite(ref, data){
+    async function queueWrite(ref, data, diagMeta){
       batch.set(ref, data);
       opsInBatch++;
+      if(diagMeta) _xacctDiag('backup-record-queued', Object.assign({batchSeq:_diagBatchSeq, path:ref.path||null}, diagMeta));
       if(opsInBatch>=MAX_BATCH_OPS){
-        await batch.commit();
+        const seq=_diagBatchSeq, opsCount=opsInBatch;
+        try{
+          await batch.commit();
+          _xacctDiag('backup-batch-committed', {batchSeq:seq, ops:opsCount, ok:true});
+        }catch(e){
+          _xacctDiag('backup-batch-committed', {batchSeq:seq, ops:opsCount, ok:false, errorCategory:'batch-commit-failed', errorCode:_xacctErrCode(e)});
+          throw e;
+        }
+        _diagBatchSeq++;
         batch=FB.db.batch();
         opsInBatch=0;
       }
@@ -2988,7 +2999,7 @@ async function cloudBackupPush(){
         // store them — Firestore's real .set() rejects a non-object
         // second argument outright.
         const toWrite=CLOUD_BACKUP_SCALAR_VALUE_TYPES.includes(type) ? {value:stripped} : stripped;
-        await queueWrite(recordsCol.doc(id), toWrite);
+        await queueWrite(recordsCol.doc(id), toWrite, {kind:'record', entityType:type, id});
         count++;
       }
       entityCounts[type]=count;
@@ -2997,9 +3008,18 @@ async function cloudBackupPush(){
     if(!_identityStillValid(idTok)) throw new Error('account-changed');
     const metaPayload=cloudBackupBuildMetaPayload(DB.meta);
     cloudBackupAssertNoSecretMaterial(metaPayload);
-    await queueWrite(versionCol.doc('_meta'), metaPayload);
+    await queueWrite(versionCol.doc('_meta'), metaPayload, {kind:'meta'});
 
-    if(opsInBatch>0) await batch.commit();
+    if(opsInBatch>0){
+      const seq=_diagBatchSeq, opsCount=opsInBatch;
+      try{
+        await batch.commit();
+        _xacctDiag('backup-batch-committed', {batchSeq:seq, ops:opsCount, ok:true, final:true});
+      }catch(e){
+        _xacctDiag('backup-batch-committed', {batchSeq:seq, ops:opsCount, ok:false, errorCategory:'batch-commit-failed', errorCode:_xacctErrCode(e), final:true});
+        throw e;
+      }
+    }
 
     // v[next] FIX (code review, 2026-09-08): the manifest write is now
     // ALSO transactional and explicitly monotonic — it only ever
@@ -3017,29 +3037,36 @@ async function cloudBackupPush(){
     // subcollection, exactly like backupRoot.doc('versions') already
     // does for the actual entity data above.
     const historyVersionRef=backupRoot.doc('historyIndex').collection('versions').doc(String(nextVersion));
-    await FB.db.runTransaction(async tx=>{
-      const snap=await tx.get(manifestRef);
-      const currentVersion=snap.exists&&typeof snap.data().version==='number'?snap.data().version:0;
-      if(nextVersion<=currentVersion){
-        throw new Error(`stale-write-prevented: attempted to write version ${nextVersion} but manifest is already at ${currentVersion}`);
-      }
-      tx.set(manifestRef,{
-        version:nextVersion, status:'complete',
-        savedAt:firebase.firestore.FieldValue.serverTimestamp(),
-        entityCounts, attachmentCount,
-        schemaVersion:SCHEMA, appVersion:(typeof APP_VERSION!=='undefined'?APP_VERSION:null)
+    try{
+      await FB.db.runTransaction(async tx=>{
+        const snap=await tx.get(manifestRef);
+        const currentVersion=snap.exists&&typeof snap.data().version==='number'?snap.data().version:0;
+        if(nextVersion<=currentVersion){
+          throw new Error(`stale-write-prevented: attempted to write version ${nextVersion} but manifest is already at ${currentVersion}`);
+        }
+        tx.set(manifestRef,{
+          version:nextVersion, status:'complete',
+          savedAt:firebase.firestore.FieldValue.serverTimestamp(),
+          entityCounts, attachmentCount,
+          schemaVersion:SCHEMA, appVersion:(typeof APP_VERSION!=='undefined'?APP_VERSION:null)
+        });
+        // Written in the SAME transaction as the manifest so the two can
+        // never go out of sync (e.g. manifest advances but history write
+        // silently fails, or vice versa).
+        tx.set(historyVersionRef,{
+          version:nextVersion, savedAt:firebase.firestore.FieldValue.serverTimestamp(),
+          entityCounts, attachmentCount, schemaVersion:SCHEMA,
+          appVersion:(typeof APP_VERSION!=='undefined'?APP_VERSION:null)
+        });
       });
-      // Written in the SAME transaction as the manifest so the two can
-      // never go out of sync (e.g. manifest advances but history write
-      // silently fails, or vice versa).
-      tx.set(historyVersionRef,{
-        version:nextVersion, savedAt:firebase.firestore.FieldValue.serverTimestamp(),
-        entityCounts, attachmentCount, schemaVersion:SCHEMA,
-        appVersion:(typeof APP_VERSION!=='undefined'?APP_VERSION:null)
-      });
-    });
+      _xacctDiag('backup-manifest-committed', {id:'manifest', path:manifestRef.path||null, version:nextVersion, ok:true});
+    }catch(e){
+      _xacctDiag('backup-manifest-committed', {id:'manifest', path:manifestRef.path||null, version:nextVersion, ok:false, errorCategory:'manifest-transaction-failed', errorCode:_xacctErrCode(e)});
+      throw e;
+    }
 
     if(!_identityStillValid(idTok)) return {ok:false, reason:'account-changed', version:nextVersion};
+    _xacctDiag('backup-push-done', {uid, version:nextVersion, entityCounts});
     DB.meta.cloudBackup=Object.assign({}, DB.meta.cloudBackup, {cloudBackupLastSyncedVersion:nextVersion, lastPushAt:new Date().toISOString(), lastPushError:null, lastPushedSaveSeq:_saveSeqAtSnapshotTime});
     // v[next] FIX (code review round 2, 2026-09-08): a successful push
     // updated DB.meta.cloudBackup only in memory — with no persistDB()
@@ -3734,6 +3761,46 @@ function persistDB(skipCloudBackupSchedule){
 // data than what loadDB() found (a device that's already migrated), that
 // newer copy wins and the UI re-renders with it.
 let _dbOwnerUid=null, _identityGen=0, _authEpoch=0;
+const XACCT_DIAG_ERROR_CODES=['account-changed','stale-write-prevented','permission-denied',
+  'unavailable','deadline-exceeded','resource-exhausted','unauthenticated','aborted','cancelled','unknown'];
+function _xacctErrCode(e){
+  let raw=null;
+  try{
+    if(e && typeof e.code==='string') raw=e.code;
+    else if(e && typeof e.message==='string'){
+      if(/^account-changed/.test(e.message)) raw='account-changed';
+      else if(/^stale-write-prevented/.test(e.message)) raw='stale-write-prevented';
+    }
+  }catch(err){}
+  return XACCT_DIAG_ERROR_CODES.includes(raw) ? raw : 'unknown';
+}
+// ── XACCT DIAGNOSTIC LOG (TEST BUILD ONLY) ──
+// Added to help pin down the exact moment/mechanism of a suspected
+// cross-account leak seen once on mbm-life-test. Logs ONLY: the
+// authenticated uid, the recorded data-owner uid, the session
+// "generation" counters (_identityGen/_authEpoch — bump on every
+// identity change, so two log lines from different sessions are never
+// mistaken for the same one), record ids, and Firestore write paths.
+// It NEVER logs task/list/note text, titles, tags, or any auth token —
+// only identifiers and counts. Capped ring buffer; also mirrored to
+// console with a fixed prefix so it can be read via remote debugging
+// (chrome://inspect) without needing the in-app export button below.
+const XACCT_DIAG_MAX=500;
+window.__xacctDiag = window.__xacctDiag || [];
+function _xacctDiag(event, fields){
+  try{
+    let liveFirebaseUid=null;
+    try{ liveFirebaseUid=(FB && FB.auth && FB.auth.currentUser && FB.auth.currentUser.uid) || null; }catch(e){}
+    let dbMetaUserId=null;
+    try{ dbMetaUserId=(DB && DB.meta && DB.meta.userId) || null; }catch(e){}
+    const entry=Object.assign({t:new Date().toISOString(), event,
+      identityGen:_identityGen, authEpoch:_authEpoch,
+      liveFirebaseUid, dbMetaUserId, confirmedOwnerUid:_dbOwnerUid}, fields||{});
+    window.__xacctDiag.push(entry);
+    if(window.__xacctDiag.length>XACCT_DIAG_MAX) window.__xacctDiag.shift();
+    console.log('[XACCT-DIAG]', JSON.stringify(entry));
+  }catch(e){ try{console.error('[XACCT-DIAG] logging failed',e);}catch(e2){} }
+}
 let _idbReadyPromise=null, _idbOpenTimedOut=false, _profileUnsub=null, _idbReadFailed=false;
 const IDB_IN_USE_LS_KEY='mbmlife_idb_in_use'; // set once IndexedDB has held this device's data
 const XACCT_Q_IDB_KEY='xacct_quarantine_v1', XACCT_Q_LS_KEY='mbmlife_xacct_quarantine_v1';
@@ -3802,14 +3869,20 @@ function _xacctQuarantine(data, info){
       try{
         await idbSet(XACCT_Q_IDB_KEY,next);
         const back=await idbGet(XACCT_Q_IDB_KEY);
-        if(Array.isArray(back) && back.some(e=>e.id===entry.id)){ console.warn('[account isolation] quarantined',info.reason,'owner:',entry.recordedOwnerUid,'signed-in:',entry.signedInUid); return true; }
+        if(Array.isArray(back) && back.some(e=>e.id===entry.id)){
+          console.warn('[account isolation] quarantined',info.reason,'owner:',entry.recordedOwnerUid,'signed-in:',entry.signedInUid);
+          _xacctDiag('quarantine-write', {entryId:entry.id, reason:info.reason, source:info.source||null, recordedOwnerUid:info.recordedOwnerUid||null, signedInUid:info.signedInUid||null, via:'idb'});
+          return true;
+        }
       }catch(e){}
     }
     try{
       localStorage.setItem(XACCT_Q_LS_KEY,JSON.stringify(next));
       const back=JSON.parse(localStorage.getItem(XACCT_Q_LS_KEY)||'[]');
-      return Array.isArray(back) && back.some(e=>e.id===entry.id);
-    }catch(e){ return false; }
+      const ok=Array.isArray(back) && back.some(e=>e.id===entry.id);
+      _xacctDiag('quarantine-write', {entryId:entry.id, reason:info.reason, source:info.source||null, recordedOwnerUid:info.recordedOwnerUid||null, signedInUid:info.signedInUid||null, via:'localStorage', ok});
+      return ok;
+    }catch(e){ _xacctDiag('quarantine-write-failed', {reason:info.reason, source:info.source||null}); return false; }
   };
   const p=_xacctChain.then(run,run);
   _xacctChain=p.catch(()=>{});
@@ -3870,6 +3943,7 @@ async function _adoptLocalDataFor(uid, alive){
   }
   const ls=_readLocalStorageCacheRaw();
   if(ls) cands.push({source:'localStorage',data:ls,owner:(ls.meta&&ls.meta.userId)||null,rank:1});
+  _xacctDiag('adopt-candidates', {forUid:uid, candidates:cands.map(c=>({source:c.source,owner:c.owner,rank:c.rank,hasUserData:_xacctHasUserData(c.data)}))});
   const eligible=cands.filter(c=>c.owner===uid);
   const foreign=cands.filter(c=>c.owner!==uid && _xacctHasUserData(c.data));
   for(const c of foreign){
@@ -3889,6 +3963,8 @@ async function _adoptLocalDataFor(uid, alive){
   if(!alive()) return {ok:false,reason:'superseded'};
   next.meta.userId=uid;
   DB=next;
+  _xacctDiag('adopt-result', {newOwnerUid:uid, adoptedFrom:winner?winner.source:null,
+    quarantinedCount:foreign.length, taskIdsNowInMemory:Object.keys(next.entities.tasks||{})});
   return {ok:true,adopted:winner?winner.source:null,quarantined:foreign.length};
 }
 
@@ -25029,6 +25105,7 @@ function createTask(text,listId){
     placeId:null,expenseId:null,noteIds:[],tags:[],steps:[],notes:'',
     createdAt:now(),updatedAt:now(),archivedAt:null
   };
+  _xacctDiag('task-created', {id, creatorId:DB.meta.userId, via:'createTask'});
   saveDB();
 }
 
@@ -25659,6 +25736,7 @@ function quickAdd(){
       placeId:null,expenseId:null,noteIds:[],tags:[],steps:[],notes:'',
       createdAt:now(),updatedAt:now(),archivedAt:null
     };
+    _xacctDiag('task-created', {id, creatorId:DB.meta.userId, via:'qa-save'});
     saveDB();closeSheet();render();toast(L==='fa'?'کار اضافه شد':'Task added');
   };
 }
@@ -26737,6 +26815,7 @@ function sessionCap(cap){ const m=sessionMode(); return !!(m && SESSION_CAPS[m] 
 /* ── Auth state ── */
 async function _onAuthUser(user){
   const epoch=++_authEpoch;
+  _xacctDiag('auth-user-start', {authenticatedUid:user.uid, epoch});
   const alive=()=>epoch===_authEpoch && !!FB.auth && !!FB.auth.currentUser && FB.auth.currentUser.uid===user.uid;
   if(_dbOwnerUid!==user.uid){
     // Not (yet) verified for this uid — including a repeat callback that
@@ -26897,6 +26976,7 @@ async function doSignOut(){
   // storage, or screen — only _onAuthUser may do that, using its own token.
   const myEpoch=++_authEpoch;
   const owned=_dbOwnedByCurrentUser() ? _dbOwnerUid : null;
+  _xacctDiag('sign-out-start', {owner:owned});
   _setDbOwner(null);     // no owner confirmed while sign-out is in progress
   if(typeof voiceHardStop==='function')voiceHardStop();
   if(typeof VaultSession!=='undefined'){ VaultSession.lock(); _vaultReveal={}; vaultView='home'; vaultActiveId=null; }
@@ -26954,6 +27034,7 @@ async function doSignOut(){
   saveDB();
   if(myEpoch!==_authEpoch) return false;
   FB.user=null;
+  _xacctDiag('sign-out-done', {previousOwner:owned, localCachesWiped:!!owned});
   const finish=()=>{ if(myEpoch===_authEpoch) showAuthScreen(); };
   if(FB.ready&&FB.auth){
     FB.auth.signOut().then(finish).catch(finish);
@@ -26972,10 +27053,14 @@ function startListeners(){
   const idTok=_identityToken();
   const ws=wsId(FB.user.uid);
   const db=FB.db;
+  _xacctDiag('listeners-start', {uid:FB.user.uid, ws});
 
   const sync=(col,entity)=>db.collection('workspaces').doc(ws).collection(col)
     .onSnapshot(snap=>{
-      if(!_identityStillValid(idTok)) return; // ACCOUNT ISOLATION: a late event from a previous identity's listener
+      if(!_identityStillValid(idTok)){
+        _xacctDiag('sync-snapshot-rejected-stale', {ws, entity, docIds:(function(){try{return snap.docChanges().map(c=>c.doc.id);}catch(e){return null;}})()});
+        return; // ACCOUNT ISOLATION: a late event from a previous identity's listener
+      }
       _ensureSyncQueues();
       snap.docChanges().forEach(ch=>{
         // Fix (Codex review round 1, regression 1): a pending unsent local
@@ -26988,7 +27073,7 @@ function startListeners(){
         const isPending = DB.meta.cloudBackup.pendingChanges.some(e=>e.entityType===entity && e.id===ch.doc.id);
         const hasConflict=DB.meta.cloudBackup.conflicts.some(c=>c.entityType===entity&&c.id===ch.doc.id);
         if(isPending||hasConflict) return;
-        if(ch.type==='removed'){ delete DB.entities[entity][ch.doc.id]; return; }
+        if(ch.type==='removed'){ delete DB.entities[entity][ch.doc.id]; _xacctDiag('snapshot-applied', {entity, id:ch.doc.id, changeType:'removed', path:(ch.doc.ref&&ch.doc.ref.path)||('workspaces/'+ws+'/'+entity+'/'+ch.doc.id)}); return; }
         const d=ch.doc.data();
         // Fix (Codex review round 2, finding 1): receiving a snapshot IS a
         // confirmed read of the current server state — it must set the
@@ -27005,6 +27090,7 @@ function startListeners(){
           _lastSyncedV: (typeof d._v==='number')?d._v:null,
           _lastKnownServerUpdatedAt: d.updatedAt, _syncBase:_csCopy(d)
         });
+        _xacctDiag('snapshot-applied', {entity, id:ch.doc.id, changeType:ch.type, path:(ch.doc.ref&&ch.doc.ref.path)||('workspaces/'+ws+'/'+entity+'/'+ch.doc.id)});
         if(!DB.meta.cloudBackup._lastSeenContent)DB.meta.cloudBackup._lastSeenContent={};
         DB.meta.cloudBackup._lastSeenContent[entity+'/'+ch.doc.id]=_csFingerprint(d);
       });
@@ -27024,6 +27110,7 @@ function startListeners(){
 }
 
 function stopListeners(){
+  _xacctDiag('listeners-stop', {unsubCount:_syncUnsubs.length});
   _syncUnsubs.forEach(u=>{try{u();}catch(e){}});
   _syncUnsubs=[];
   if(_profileUnsub){ try{_profileUnsub();}catch(e){} _profileUnsub=null; }
@@ -27262,11 +27349,13 @@ async function _syncOneItem(entityType,id,baseV,ws,uidOfCaller){
   if(!await _csPersist()) return {ok:false,reason:'local-save-failed'};
   if(!_identityStillValid(idTok)) return {ok:false,reason:'account-changed'};
   const ref=FB.db.collection('workspaces').doc(ws).collection(entityType).doc(id);
+  _xacctDiag('sync-write-attempt', {entityType, id, ownerUid:owner, ws, path:ref.path||('workspaces/'+ws+'/'+entityType+'/'+id)});
   try{
     const result=await _csTimedCommit(ref,operation);
     if(owner!==cloudBackupUid() || !_identityStillValid(idTok)) return {ok:false,reason:'account-changed'};
     const item=DB.entities[entityType]&&DB.entities[entityType][id];
     if(item){item._lastSyncedV=result.writtenV;item._lastKnownServerUpdatedAt=operation.payload.updatedAt;item._v=result.writtenV;item._syncBase=_csCopy(result.serverItem);}
+    _xacctDiag('sync-write-done', {entityType, id, ownerUid:owner, ws, writtenV:result.writtenV});
     return Object.assign({ok:true,payload:operation.payload,opId:operation.opId},result);
   }catch(e){
     if(!_identityStillValid(idTok)) return {ok:false,reason:'account-changed'};
@@ -27926,6 +28015,11 @@ function openSettingsSheet(){
         </div>
         <button class="btn btn-ghost" id="cb-test-history" style="width:100%;margin-top:8px">Restore a specific version…</button>
         <div id="cb-test-history-list" style="margin-top:8px;display:none"></div>
+        <div style="display:flex;gap:8px;margin-top:8px">
+          <button class="btn btn-ghost" id="cb-test-diag-copy" style="flex:1">Copy diagnostic log (${(window.__xacctDiag||[]).length})</button>
+          <button class="btn btn-ghost" id="cb-test-diag-clear" style="flex:1">Clear diagnostic log</button>
+        </div>
+        <div style="font-size:10px;color:var(--ink3);margin-top:4px">No task/list/note text is ever recorded — only uids, owners, session numbers, record ids and write paths.</div>
       </div>
 
       <div class="hub-sec-label" id="cb-conflicts-label" style="display:none"></div>
@@ -28045,6 +28139,20 @@ function openSettingsSheet(){
     }
     renderConflictsPanel();
 
+    const diagCopyBtn=document.getElementById('cb-test-diag-copy');
+    const diagClearBtn=document.getElementById('cb-test-diag-clear');
+    if(diagCopyBtn) diagCopyBtn.onclick=async()=>{
+      const text=JSON.stringify(window.__xacctDiag||[], null, 1);
+      try{
+        if(navigator.clipboard && navigator.clipboard.writeText){ await navigator.clipboard.writeText(text); toast('Diagnostic log copied ('+(window.__xacctDiag||[]).length+' entries)'); }
+        else{ prompt('Copy the diagnostic log below:', text); }
+      }catch(e){ prompt('Copy the diagnostic log below:', text); }
+    };
+    if(diagClearBtn) diagClearBtn.onclick=()=>{
+      window.__xacctDiag=[];
+      if(diagCopyBtn) diagCopyBtn.textContent='Copy diagnostic log (0)';
+      toast('Diagnostic log cleared');
+    };
     const historyBtn=document.getElementById('cb-test-history');
     const historyListEl=document.getElementById('cb-test-history-list');
     let historyLoadedVersions=[]; // accumulates across "show more" pages, oldest-loaded at the end
