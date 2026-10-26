@@ -2211,7 +2211,7 @@ try{
     });
   });
 }catch(e){}
-const APP_VERSION='v599';
+const APP_VERSION='v602';
 const SCHEMA=1;
 const KEY='mbmlife_platform_v1';
 /* Global: true when running inside the MBM Life Android companion WebView
@@ -9821,7 +9821,7 @@ const HEALTH_UI={
     under18Title:'This test is for adults', under18Body:'The ASRS screener is designed and validated for adults (18+). Children and teenagers need a different assessment, usually completed with a parent or teacher. A version for young people is not available yet; talk to a GP or school psychologist if you have concerns.',
     helperLabel:'Helper translation (unofficial)', helperNote:'Part 1 was answered with the unofficial Persian helper translation visible. The 14+ threshold was validated on the English version.', adults:'Adults (18+)',
     next:'Next', prev:'Previous', exit:'Save and exit', answerAll:'Please answer every question on this page.',
-    secAsrs:'Part 1 — ASRS screener', secCtx:'Part 2 — Background', ctxIntro:'In the questions below, "these difficulties" means the attention, restlessness and impulsivity difficulties you answered about in Part 1 — for example trouble finishing tasks, staying organised, remembering appointments, putting off tasks that need a lot of thought, fidgeting, or feeling driven by a motor.', secProfile:'Part 3 — Answer profile',
+    secAsrs:'Part 1 of 3 — ASRS screener', secCtx:'Part 2 of 3 — Background', ctxIntro:'In the questions below, "these difficulties" means the attention, restlessness and impulsivity difficulties you answered about in Part 1 — for example trouble finishing tasks, staying organised, remembering appointments, putting off tasks that need a lot of thought, fidgeting, or feeling driven by a motor.', secProfile:'Part 3 of 3 — Answer profile', mapTitle:'How this works', map:[['Part 1 — ASRS screener','6 questions, required','The official screening test. Your result comes from this part only.'],['Part 2 — Background','5 yes/no questions, required','Does not change your score; decides which guidance you see.'],['Part 3 — Answer profile','96 statements, optional','A descriptive profile. You can skip it and add it later from the result page.']], profIntro:'Optional part. 96 short statements about everyday life. Choose how much each one is true for you. This part does not change your Part 1 screening result; it only adds a descriptive profile to it.', profIntroAdd:'You are adding the optional profile to your saved result. Parts 1 and 2 are already done and will not change.',
     asrsEnglishNote:'', complete:'{p}% complete', pageOf:'Page {a} of {b}',
     saveFailed:'Your last answer could not be saved on this device. Your answers are kept while the app stays open.',
     choiceTitle:'Parts 1 and 2 are done', choiceBody:'You can see your screening result now, or continue with the optional 96-statement profile. The profile can also be added later from the result page.',
@@ -9868,7 +9868,7 @@ const HEALTH_UI={
     under18Title:'این آزمون برای بزرگسالان است', under18Body:'پرسشنامهٔ ASRS برای بزرگسالان (۱۸+) طراحی و اعتبارسنجی شده است. کودکان و نوجوانان به ارزیابیِ دیگری نیاز دارند که معمولاً با کمکِ والدین یا معلم انجام می‌شود. نسخهٔ نوجوانان هنوز در دسترس نیست؛ اگر نگرانی دارید با پزشک عمومی یا روان‌شناسِ مدرسه صحبت کنید.',
     helperLabel:'ترجمهٔ کمکی (غیررسمی)', helperNote:'بخش ۱ با نمایشِ ترجمهٔ کمکیِ غیررسمیِ فارسی پاسخ داده شد. آستانهٔ ۱۴ برای نسخهٔ انگلیسی سنجیده شده است.', adults:'بزرگسالان (۱۸+)',
     next:'بعدی', prev:'قبلی', exit:'ذخیره و خروج', answerAll:'لطفاً به همهٔ سؤال‌های این صفحه پاسخ دهید.',
-    secAsrs:'بخش ۱ — پرسشنامهٔ ASRS', secCtx:'بخش ۲ — سوابق', ctxIntro:'در سؤال‌های زیر، منظور از «این مشکلات» همان مشکلاتِ تمرکز، بی‌قراری و عجول بودن است که در بخش ۱ درباره‌شان جواب دادید؛ مثلاً تمام‌نکردنِ کارها، نظم‌ندادن به کارها، یادرفتنِ قرارها، عقب‌انداختنِ کارهایی که فکر زیادی می‌خواهند، وول‌خوردن، یا حسِ اینکه انگار موتوری شما را به حرکت وادار می‌کند.', secProfile:'بخش ۳ — پروفایلِ پاسخ‌ها',
+    secAsrs:'بخش ۱ از ۳ — پرسشنامهٔ ASRS', secCtx:'بخش ۲ از ۳ — سوابق', ctxIntro:'در سؤال‌های زیر، منظور از «این مشکلات» همان مشکلاتِ تمرکز، بی‌قراری و عجول بودن است که در بخش ۱ درباره‌شان جواب دادید؛ مثلاً تمام‌نکردنِ کارها، نظم‌ندادن به کارها، یادرفتنِ قرارها، عقب‌انداختنِ کارهایی که فکر زیادی می‌خواهند، وول‌خوردن، یا حسِ اینکه انگار موتوری شما را به حرکت وادار می‌کند.', secProfile:'بخش ۳ از ۳ — پروفایلِ پاسخ‌ها', mapTitle:'این تست چطور است', map:[['بخش ۱ — پرسشنامهٔ ASRS','۶ سؤال، اجباری','تستِ رسمیِ غربالگری. نتیجه فقط از همین بخش درمی‌آید.'],['بخش ۲ — سوابق','۵ سؤالِ بله/خیر، اجباری','روی امتیاز اثر ندارد؛ تعیین می‌کند چه راهنمایی‌ای نشان داده شود.'],['بخش ۳ — پروفایلِ پاسخ‌ها','۹۶ جمله، اختیاری','یک پروفایلِ توصیفی. می‌توانید ردش کنید و بعداً از صفحهٔ نتیجه اضافه‌اش کنید.']], profIntro:'این بخش اختیاری است: ۹۶ جملهٔ کوتاه دربارهٔ زندگی روزمره. برای هر جمله انتخاب کنید چقدر دربارهٔ شما صدق می‌کند. این بخش نتیجهٔ غربالگریِ بخش ۱ را تغییر نمی‌دهد؛ فقط یک پروفایلِ توصیفی به آن اضافه می‌کند.', profIntroAdd:'در حال افزودن پروفایلِ اختیاری به نتیجهٔ ذخیره‌شدهٔ خود هستید. بخش ۱ و ۲ قبلاً انجام شده و تغییر نمی‌کند.',
     asrsEnglishNote:'این پرسشنامهٔ معتبر به نسخهٔ رسمیِ انگلیسی نمایش داده می‌شود. زیرِ هر سؤال یک ترجمهٔ کمکیِ غیررسمی آمده است؛ مبنای پاسخ، متنِ انگلیسی است.',
     complete:'{p}٪ تکمیل شده', pageOf:'صفحهٔ {a} از {b}',
     saveFailed:'آخرین پاسخ روی این دستگاه ذخیره نشد. تا وقتی اپ باز است پاسخ‌ها نگه داشته می‌شوند.',
@@ -10121,6 +10121,7 @@ function healthResetMemory(){
 }
 // Hook for doSignOut(): wipes memory and deletes ALL health data on this device. Never throws.
 async function healthOnSignOut(){
+  healthPrintCleanup();
   healthResetMemory();
   if(!HealthStore.available()) return;
   HealthStore.markPendingAll(); // cleared only when the deletion below actually commits
@@ -10130,6 +10131,7 @@ async function healthOnSignOut(){
 }
 // Hook for _onAuthUser(): wipes memory if the identity changed and deletes every other account's data. Never throws.
 function healthOnAuthUser(uid){
+  healthPrintCleanup();
   try{ if(HS.uid && HS.uid!==uid) healthResetMemory(); }catch(e){}
   try{ if(HealthStore.available()) HealthStore.shredAllExcept(uid).catch(()=>{}); }catch(e){}
 }
@@ -10260,7 +10262,7 @@ function healthRenderHome(){
   h+=`<div class="hl-card"><span class="hl-tag">${healthEsc(healthT('adults'))}</span>`;
   if(HS.draft && HS.draft.run){
     const p=healthProgress(HS.draft.run);
-    h+=`<button class="hl-btn pri" data-h="resume">${healthEsc(healthT('resume'))} · ${healthEsc(healthNum(p))}%</button>`;
+    h+=`<button class="hl-btn pri" data-h="resume">${healthEsc(healthT('resume'))} (<bdi dir="ltr">${healthEsc(healthNum(p))}%</bdi>)</button>`;
     if(HS.confirm==='discard') h+=`<p>${healthEsc(healthT('discardConfirm'))}</p><div class="hl-row"><button class="hl-btn dng" data-h="discardYes">${healthEsc(healthT('del'))}</button><button class="hl-btn" data-h="cancel">${healthEsc(healthT('cancel'))}</button></div>`;
     else h+=`<button class="hl-btn" data-h="discard">${healthEsc(healthT('discard'))}</button>`;
   }else{
@@ -10285,7 +10287,8 @@ function healthRenderHome(){
 function healthRenderNotice(){
   let h=`<div class="hl-card">${healthArt('notice')}<h2>${healthEsc(healthT('noticeTitle'))}</h2><ul>`;
   healthT('notice').forEach(x=>{ h+=`<li>${healthEsc(x)}</li>`; });
-  h+=`</ul><p><b>${healthEsc(healthT('ageQ'))}</b></p><button class="hl-btn pri" data-h="begin">${healthEsc(healthT('begin'))}</button><button class="hl-btn" data-h="under18">${healthEsc(healthT('under18'))}</button></div>`;
+  h+=`</ul><h3>${healthEsc(healthT('mapTitle'))}</h3><ul class="hl-map" style="list-style:none;padding:0">${healthT('map').map(m=>`<li style="margin:0 0 10px"><b>${healthEsc(m[0])}</b> <span class="hl-muted">(${healthEsc(m[1])})</span><br>${healthEsc(m[2])}</li>`).join('')}</ul>`;
+  h+=`<p><b>${healthEsc(healthT('ageQ'))}</b></p><button class="hl-btn pri" data-h="begin">${healthEsc(healthT('begin'))}</button><button class="hl-btn" data-h="under18">${healthEsc(healthT('under18'))}</button></div>`;
   return h;
 }
 function healthRenderUnder18(){
@@ -10337,6 +10340,7 @@ function healthRenderRun(){
     if(tx.fallback && healthT('asrsEnglishNote')) h+=`<p class="hl-muted">${healthEsc(healthT('asrsEnglishNote'))}</p>`;
     h+=`<p class="hl-ltr" dir="ltr" style="font-weight:600">${healthEsc(tx.title)}</p><p class="hl-ltr" dir="ltr">${healthEsc(tx.instructions)}</p>`;
   }
+  if(pg.sec==='profile' && firstOfSec){ if(run.profileOnly) h+=`<p class="hl-profintro" style="font-weight:600;line-height:1.8">${healthEsc(healthT('profIntroAdd'))}</p>`; h+=`<p class="hl-profintro" style="line-height:1.8">${healthEsc(healthT('profIntro'))}</p>`; }
   if(pg.sec==='ctx') h+=`<p class="hl-ctxintro" style="font-weight:600;line-height:1.8">${healthEsc(healthT('ctxIntro'))}</p>`;
   pg.items.forEach(q=>{ h+=healthQuestionHtml(q, run); });
   h+=`<p class="hl-muted" id="hl-pagemsg" style="display:none">${healthEsc(healthT('answerAll'))}</p>`;
@@ -10378,7 +10382,7 @@ function healthRenderResult(r){
     const ptx=healthText('profile',hl);
     HEALTH_PROFILE_DOMAINS.forEach(d=>{
       const x=r.profile.domains[d]; if(!x) return;
-      h+=`<h3>${healthEsc(healthT('domains')[d])} · ${healthEsc(healthNum(x.percent))}%</h3><div class="hl-bar" role="img" aria-label="${healthEsc(healthT('domains')[d])} ${x.percent}%"><i style="width:${x.percent}%"></i></div>`;
+      h+=`<h3>${healthEsc(healthT('domains')[d])}: <bdi dir="ltr">${healthEsc(healthNum(x.percent))}%</bdi></h3><div class="hl-bar" role="img" aria-label="${healthEsc(healthT('domains')[d])} ${x.percent}%"><i style="width:${x.percent}%"></i></div>`;
       if(x.high && x.high.length){ h+=`<p class="hl-muted">${healthEsc(healthT('youSaid'))}</p><ul>`; x.high.forEach(i=>{ h+=`<li>${healthEsc(ptx.items[String(i)])}</li>`; }); h+=`</ul>`; }
     });
   }else{
@@ -10469,7 +10473,8 @@ async function healthFinish(){
   HS.draft=null; HS.run=null; HS.view='result'; HS.viewId=rec.id; HS.saveFailed=false;
   return true;
 }
-function healthGo(view){ HS.view=view; HS.confirm=null; render(); try{ window.scrollTo(0,0); }catch(e){} }
+function healthPrintCleanup(){ try{ document.documentElement.classList.remove('hl-printing'); const b=document.getElementById('hl-print'); if(b) b.remove(); }catch(e){} }
+function healthGo(view){ healthPrintCleanup(); HS.view=view; HS.confirm=null; render(); try{ window.scrollTo(0,0); }catch(e){} }
 async function healthOnClick(e){
   const b=e.target.closest('[data-h]'); if(!b) return;
   const act=b.dataset.h; const uid=HS.uid;
@@ -10510,13 +10515,51 @@ async function healthOnClick(e){
         HS.results=HS.results.filter(x=>x.id!==id); HS.viewId=null; healthGo('home'); break;
       }
       case 'print': HS.confirm='print'; render(); break;
-      case 'printYes': HS.confirm=null; render(); try{ window.print(); }catch(err){} break;
+      case 'printYes': HS.confirm=null; render(); healthPrint(); break;
       case 'addprof': { const id=b.dataset.id; HS.run=healthNewRun({profileOnly:true, includeProfile:true, targetResultId:id}); await healthSaveDraft(); healthGo('run'); break; }
       case 'retry': HS.loaded=false; HS.blocked=false; HS.error=null; render(); break;
     }
   }catch(err){
     if(HS.uid===uid){ HS.error=String((err&&err.message)||err); render(); }
   }
+}
+function healthPrint(){
+  const old=document.getElementById('hl-print'); if(old) old.remove();
+  const src=document.querySelector('.hl-root'); if(!src) return;
+  const r=HS.results.find(x=>x.id===HS.viewId);
+  const box=document.createElement('div'); box.id='hl-print';
+  const hl=healthLang(); box.setAttribute('dir',HEALTH_LOCALES[hl].dir); box.setAttribute('lang',hl);
+  const clone=src.cloneNode(true);
+  clone.querySelectorAll('button,.hl-btn,script').forEach(e=>e.remove());
+  clone.querySelectorAll('.hl-card').forEach(c=>{ if(!c.textContent.trim()) c.remove(); });
+  clone.querySelectorAll('[style*="display:none"]').forEach(e=>e.remove());
+  const head=document.createElement('div'); head.className='hl-phead';
+  head.innerHTML=`<b>MBM Life — ${healthEsc(healthT('resultTitle'))}</b><br>${healthEsc(r?healthT('takenOn',{d:healthDate(r.createdAt)}):'')}`;
+  const st=document.createElement('style');
+  st.textContent='@media screen{#hl-print{display:none!important}}'+
+   '@media print{html.hl-printing body>*:not(#hl-print){display:none!important}'+
+   'html.hl-printing,html.hl-printing body{height:auto!important;min-height:0!important;overflow:visible!important;background:#fff!important;position:static!important}'+
+   '#hl-print{display:block!important;position:static!important;width:auto!important;max-width:none!important;margin:0!important;padding:0 4mm!important;color:#000!important;background:#fff!important;font-size:12pt;line-height:1.6}'+
+   '#hl-print *{color:#000!important;background-color:transparent!important;box-shadow:none!important;overflow:visible!important;max-height:none!important;position:static!important}'+
+   '#hl-print .hl-card{border:1px solid #bbb!important;border-radius:6px;padding:8px 12px!important;margin:0 0 8px!important;break-inside:auto}'+
+   '#hl-print h2,#hl-print h3{break-after:avoid}'+
+   '#hl-print .hl-bar{border:1px solid #888!important;background:#eee!important;-webkit-print-color-adjust:exact;print-color-adjust:exact;height:10px}'+
+   '#hl-print .hl-bar>i{background:#0f766e!important;-webkit-print-color-adjust:exact;print-color-adjust:exact}'+
+   '#hl-print svg{max-width:120px;height:auto}'+
+   '#hl-print .hl-phead{margin:0 0 8px;font-size:11pt}'+
+   '@page{margin:12mm}}';
+  box.appendChild(st); box.appendChild(head);
+  while(clone.firstChild) box.appendChild(clone.firstChild);
+  document.body.appendChild(box);
+  document.documentElement.classList.add('hl-printing');
+  // Kept until the user leaves the result, signs out or switches account (Android print may render after print() returns).
+  // Removed on the next tap after returning from the print dialog, ~2 s after afterprint, or on navigation/sign-out.
+  const later=()=>{ document.removeEventListener('pointerdown',onTap,true); window.removeEventListener('afterprint',onAfter); healthPrintCleanup(); };
+  const onTap=()=>later();
+  const onAfter=()=>setTimeout(later,2000);
+  window.addEventListener('afterprint',onAfter);
+  setTimeout(()=>document.addEventListener('pointerdown',onTap,true),1000);
+  try{ window.print(); }catch(err){ later(); }
 }
 function healthBind(){
   const root=document.querySelector('.hl-root'); if(!root) return;
