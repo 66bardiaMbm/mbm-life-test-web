@@ -2211,7 +2211,7 @@ try{
     });
   });
 }catch(e){}
-const APP_VERSION='v597';
+const APP_VERSION='v598';
 const SCHEMA=1;
 const KEY='mbmlife_platform_v1';
 /* Global: true when running inside the MBM Life Android companion WebView
@@ -9821,7 +9821,7 @@ const HEALTH_UI={
     under18Title:'This test is for adults', under18Body:'The ASRS screener is designed and validated for adults (18+). Children and teenagers need a different assessment, usually completed with a parent or teacher. A version for young people is not available yet; talk to a GP or school psychologist if you have concerns.',
     helperLabel:'Helper translation (unofficial)', helperNote:'Part 1 was answered with the unofficial Persian helper translation visible. The 14+ threshold was validated on the English version.', adults:'Adults (18+)',
     next:'Next', prev:'Previous', exit:'Save and exit', answerAll:'Please answer every question on this page.',
-    secAsrs:'Part 1 — ASRS screener', secCtx:'Part 2 — Background', secProfile:'Part 3 — Answer profile',
+    secAsrs:'Part 1 — ASRS screener', secCtx:'Part 2 — Background', ctxIntro:'In the questions below, "these difficulties" means the attention, restlessness and impulsivity difficulties you answered about in Part 1 — for example trouble finishing tasks, staying organised, remembering appointments, putting off tasks that need a lot of thought, fidgeting, or feeling driven by a motor.', secProfile:'Part 3 — Answer profile',
     asrsEnglishNote:'', complete:'{p}% complete', pageOf:'Page {a} of {b}',
     saveFailed:'Your last answer could not be saved on this device. Your answers are kept while the app stays open.',
     choiceTitle:'Parts 1 and 2 are done', choiceBody:'You can see your screening result now, or continue with the optional 96-statement profile. The profile can also be added later from the result page.',
@@ -9868,7 +9868,7 @@ const HEALTH_UI={
     under18Title:'این آزمون برای بزرگسالان است', under18Body:'پرسشنامهٔ ASRS برای بزرگسالان (۱۸+) طراحی و اعتبارسنجی شده است. کودکان و نوجوانان به ارزیابیِ دیگری نیاز دارند که معمولاً با کمکِ والدین یا معلم انجام می‌شود. نسخهٔ نوجوانان هنوز در دسترس نیست؛ اگر نگرانی دارید با پزشک عمومی یا روان‌شناسِ مدرسه صحبت کنید.',
     helperLabel:'ترجمهٔ کمکی (غیررسمی)', helperNote:'بخش ۱ با نمایشِ ترجمهٔ کمکیِ غیررسمیِ فارسی پاسخ داده شد. آستانهٔ ۱۴ برای نسخهٔ انگلیسی سنجیده شده است.', adults:'بزرگسالان (۱۸+)',
     next:'بعدی', prev:'قبلی', exit:'ذخیره و خروج', answerAll:'لطفاً به همهٔ سؤال‌های این صفحه پاسخ دهید.',
-    secAsrs:'بخش ۱ — پرسشنامهٔ ASRS', secCtx:'بخش ۲ — سوابق', secProfile:'بخش ۳ — پروفایلِ پاسخ‌ها',
+    secAsrs:'بخش ۱ — پرسشنامهٔ ASRS', secCtx:'بخش ۲ — سوابق', ctxIntro:'در سؤال‌های زیر، منظور از «این مشکلات» همان مشکلاتِ تمرکز، بی‌قراری و عجول بودن است که در بخش ۱ درباره‌شان جواب دادید؛ مثلاً تمام‌نکردنِ کارها، نظم‌ندادن به کارها، یادرفتنِ قرارها، عقب‌انداختنِ کارهایی که فکر زیادی می‌خواهند، وول‌خوردن، یا حسِ اینکه انگار موتوری شما را به حرکت وادار می‌کند.', secProfile:'بخش ۳ — پروفایلِ پاسخ‌ها',
     asrsEnglishNote:'این پرسشنامهٔ معتبر به نسخهٔ رسمیِ انگلیسی نمایش داده می‌شود. زیرِ هر سؤال یک ترجمهٔ کمکیِ غیررسمی آمده است؛ مبنای پاسخ، متنِ انگلیسی است.',
     complete:'{p}٪ تکمیل شده', pageOf:'صفحهٔ {a} از {b}',
     saveFailed:'آخرین پاسخ روی این دستگاه ذخیره نشد. تا وقتی اپ باز است پاسخ‌ها نگه داشته می‌شوند.',
@@ -10321,7 +10321,7 @@ function healthRenderRun(){
   const pg=pages[run.page]; const hl=healthLang();
   const p=healthProgress(run);
   let h=`<div class="hl-banner" id="hl-savebanner" role="alert" style="${HS.saveFailed?'':'display:none'}">${healthEsc(healthT('saveFailed'))}</div>`;
-  h+=`<div class="hl-card"><div class="hl-muted hl-pmeta"><bdi>${healthEsc(healthT('pageOf',{a:healthNum(run.page+1),b:healthNum(pages.length)}))}</bdi> · <bdi id="hl-pct">${healthEsc(healthT('complete',{p:healthNum(p)}))}</bdi></div><div class="hl-prog"><i id="hl-progbar" style="width:${p}%"></i></div></div>`;
+  h+=`<div class="hl-card"><div class="hl-muted hl-pmeta"><bdi>${healthEsc(healthT('pageOf',{a:healthNum(run.page+1),b:healthNum(pages.length)}))}</bdi> <span aria-hidden="true">|</span> <bdi id="hl-pct">${healthEsc(healthT('complete',{p:healthNum(p)}))}</bdi></div><div class="hl-prog"><i id="hl-progbar" style="width:${p}%"></i></div></div>`;
   if(pg.sec==='choice'){
     h+=`<div class="hl-card"><h2>${healthEsc(healthT('choiceTitle'))}</h2><p>${healthEsc(healthT('choiceBody'))}</p>
       <button class="hl-btn pri" data-h="choice" data-v="no">${healthEsc(healthT('finishNow'))}</button>
@@ -10337,6 +10337,7 @@ function healthRenderRun(){
     if(tx.fallback && healthT('asrsEnglishNote')) h+=`<p class="hl-muted">${healthEsc(healthT('asrsEnglishNote'))}</p>`;
     h+=`<p class="hl-ltr" dir="ltr" style="font-weight:600">${healthEsc(tx.title)}</p><p class="hl-ltr" dir="ltr">${healthEsc(tx.instructions)}</p>`;
   }
+  if(pg.sec==='ctx') h+=`<p class="hl-ctxintro" style="font-weight:600;line-height:1.8">${healthEsc(healthT('ctxIntro'))}</p>`;
   pg.items.forEach(q=>{ h+=healthQuestionHtml(q, run); });
   h+=`<p class="hl-muted" id="hl-pagemsg" style="display:none">${healthEsc(healthT('answerAll'))}</p>`;
   h+=`</div>`;
